@@ -1091,7 +1091,7 @@ const FIREBASE_CONFIG={
 const API_BASE='https://us-central1-zindagi-1c81c.cloudfunctions.net/api';
 let BOT_USERNAME='zindagiRObot';   /* если задан TG_TOKEN — подставится автоматически */
 /* ===== Telegram-бот ===== */
-const TG_TOKEN='8813725512:AAH7WZ63IsmSIIvNx1bGuYVEc5pumaN6wGM';   /* токен бота от @BotFather — обязательно. Пока пусто, регистрация работает как раньше */
+const TG_TOKEN='8813725512:AAEHHs81rQSLSTx0DeTVvNFo7jIKG2NWtsM';   /* токен бота от @BotFather — обязательно. Пока пусто, регистрация работает как раньше */
 const TG_CHAT='8506743201';    /* ваш chat id — необязательно: сюда приходят уведомления о новых регистрациях */
 const BOT_READY=!!TG_TOKEN;
 const tgApi=async(method,body)=>{const r=await fetch('https://api.telegram.org/bot'+TG_TOKEN+'/'+method,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});const j=await r.json();if(!j.ok)throw Object.assign(new Error(j.description||'telegram'),{code:j.error_code});return j.result};
