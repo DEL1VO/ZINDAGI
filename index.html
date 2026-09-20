@@ -1101,7 +1101,17 @@ const tgAdmin=text=>TG_CHAT?tgSend(text,TG_CHAT):Promise.resolve(false);
 async function tgFindStart(token){const upd=await tgApi('getUpdates',{offset:-100,limit:100,allowed_updates:['message']});
   for(const u of upd){const m=u.message;if(m&&m.chat&&m.chat.type==='private'&&m.from&&typeof m.text==='string'){const x=m.text.trim().match(/^\/start(?:@\w+)?\s+(\S+)$/);if(x&&x[1]===token)return m}}return null}
 if(BOT_READY)tgApi('getMe').then(r=>{if(r&&r.username)BOT_USERNAME=r.username}).catch(()=>{});
+/* getUpdates (long-polling) и webhook у бота несовместимы — Telegram отвечает 409, если webhook включён.
+   Снимаем webhook автоматически при каждом запуске, чтобы вход через бота всегда работал без ручных действий. */
+if(BOT_READY)tgApi('deleteWebhook',{drop_pending_updates:false}).catch(()=>{});
 const newStartToken=()=>{const a=new Uint8Array(16);try{crypto.getRandomValues(a)}catch(e){for(let i=0;i<16;i++)a[i]=Math.random()*256}return Array.from(a,x=>x.toString(16).padStart(2,'0')).join('')};
+/* Открытие ссылки на Telegram-бота: window.open внутри встроенного браузера (Telegram/Instagram/FB webview)
+   часто открывает пустую вкладку вместо перехода — поэтому там используем прямой переход в текущем окне.
+   В обычном браузере пробуем открыть новую вкладку, а если её заблокировали — тоже переходим напрямую. */
+function openTgLink(link){
+  if(PWA.inApp()){location.href=link;return}
+  try{const w=window.open(link,'_blank','noopener');if(!w)location.href=link}catch(e){location.href=link}
+}
 let FB=null;
 try{if(window.firebase){firebase.initializeApp(FIREBASE_CONFIG);FB={auth:firebase.auth(),db:firebase.database()}}}catch(e){console.warn('Firebase init failed',e)}
 
@@ -1260,7 +1270,7 @@ function resetAll(){try{localStorage.removeItem(KEY)}catch(e){}try{if(FB)FB.auth
 const NO_BOT_HINT='Бот не подключён: впишите токен бота в строку TG_TOKEN в начале скрипта файла index.html — после этого регистрация и вход заработают через Telegram.';
 function startLogin(){Object.assign(REG,{login:true,viaBot:true,name:'',sessionId:uid()+uid(),token:'',live:false,sent:false,code:null,otpHash:null,attempts:0,used:false,pin1:null,returning:false,startToken:newStartToken(),chatId:null,tgId:null,tgName:'',tgUser:''});
   REG.link='https://t.me/'+BOT_USERNAME+'?start='+REG.startToken;
-  try{window.open(REG.link,'_blank','noopener')}catch(e){}   /* сразу открываем Telegram */
+  openTgLink(REG.link);   /* сразу открываем Telegram */
   setPhase('tg')}
 function authWelcome(A){
   A.innerHTML=`<div class="ahero"><div class="abg">${heroSVG('a')}</div><div class="mkt"><img src="${MARK}" alt="ZINDAGI"></div>
@@ -1282,7 +1292,7 @@ function authWelcome(A){
     if(n.length<2){er.textContent='Введите имя';nm.focus();return}if(p.length!==9){er.textContent='Введите номер полностью: 9 цифр после +992';ph.focus();return}
     Object.assign(REG,{name:n,phone:p,sessionId:uid()+uid(),token:'',link:'',live:false,sent:false,code:null,otpHash:null,attempts:0,used:false,pin1:null,returning:false,viaBot:false,startToken:'',chatId:null,tgId:null,tgName:'',tgUser:'',login:false});
     if(BOT_READY){REG.viaBot=true;REG.startToken=newStartToken();REG.link='https://t.me/'+BOT_USERNAME+'?start='+REG.startToken;
-      try{window.open(REG.link,'_blank','noopener')}catch(e){}   /* открываем Telegram сразу по нажатию */
+      openTgLink(REG.link);   /* открываем Telegram сразу по нажатию */
       return setPhase('tg')}
     if(!FB)return setPhase('tg');
     const btn=$('#r_go',A);btn.disabled=true;btn.textContent='Подготовка…';
@@ -1334,11 +1344,12 @@ function authTg(A){
             if(await botCode()){stop();renderAuth();return}
             return fail('Не удалось отправить код в чат с ботом. Вернитесь назад и повторите.')}}
         catch(e){if(e.code===401||e.code===404)return fail('Неверный токен бота (TG_TOKEN).');
-          if(e.code===409)return fail('У бота включён webhook — для этого режима он должен быть отключён.')}
+          if(e.code===409){try{await tgApi('deleteWebhook',{drop_pending_updates:false})}catch(_e){}   /* автоматически снимаем webhook и пробуем ещё раз, без показа ошибки пользователю */
+            busy=false;clearTimeout(timer);timer=setTimeout(tick,1200);return}}
         busy=false;clearTimeout(timer);timer=setTimeout(tick,2000)};
       const vis=()=>{if(!document.hidden){clearTimeout(timer);tick()}};
       document.addEventListener('visibilitychange',vis);timer=setTimeout(tick,1500);return}
-    if(!live){$('#t_open',A).onclick=async()=>{try{window.open('https://t.me/'+BOT_USERNAME,'_blank','noopener')}catch(e){}await sendOtp();renderAuth()};return}
+    if(!live){$('#t_open',A).onclick=async()=>{openTgLink('https://t.me/'+BOT_USERNAME);await sendOtp();renderAuth()};return}
     const st=$('#t_st',A);
     const poll=async()=>{if(!st.isConnected||UI.phase!=='tg')return;
       try{const r=await api('/register/status?token='+REG.token,{method:'GET'});
