@@ -14,6 +14,9 @@ ZINDAGI · платёжный бот «Премиум»
      разблокируется само (оно читает эту запись).
 
 Запуск:  pip install -r requirements.txt  →  заполнить .env  →  python bot.py
+На хостинге (Bothost и т. п.): переменные — в панели хостинга или в файле .env рядом с bot.py;
+ключ Firebase — переменной FIREBASE_CREDENTIALS_JSON (ключ проекта ZINDAGI, не другого проекта!);
+база заявок хранится в DATA_DIR, если такая переменная есть.
 """
 from __future__ import annotations
 
@@ -66,7 +69,11 @@ class Cfg:
         self.wait_min = float(env.get("WAIT_MINUTES", "10"))
         self.days = int(env.get("PREMIUM_DAYS", "30"))
         self.app_url = env.get("APP_URL", "").strip()
-        self.sqlite = env.get("SQLITE_PATH", "premium.sqlite3").strip()
+        # База заявок и подписок (SQLite). На хостингах с постоянной папкой (Bothost: DATA_DIR=/app/data) кладём её туда,
+        # иначе при пересоздании контейнера файл пропадёт вместе с заявками и сроками подписок.
+        data_dir = env.get("DATA_DIR", "").strip()
+        default_db = os.path.join(data_dir, "premium.sqlite3") if data_dir else "premium.sqlite3"
+        self.sqlite = (env.get("SQLITE_PATH", "").strip() or default_db)
 
     def check(self) -> None:
         if not self.token:
@@ -173,6 +180,8 @@ class Firebase:
 # ───────────────────────────── хранилище ─────────────────────────────
 class Store:
     def __init__(self, path: str):
+        folder = os.path.dirname(os.path.abspath(path))
+        os.makedirs(folder, exist_ok=True)
         self.c = sqlite3.connect(path, check_same_thread=False)
         self.c.row_factory = sqlite3.Row
         self.c.executescript("""
