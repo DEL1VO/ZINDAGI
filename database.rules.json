@@ -1,0 +1,28 @@
+{
+  "rules": {
+    ".read": false,
+    ".write": false,
+    "premium": {
+      "$uid": {
+        ".read": true
+      }
+    },
+    "sessions": {
+      "$token": {
+        ".read": "$token.length == 32"
+      }
+    },
+    "outbox": {
+      "$id": {
+        ".write": "!data.exists() && newData.exists()",
+        ".validate": "newData.hasChildren(['chat','text']) && newData.child('chat').isString() && newData.child('chat').val().matches(/^[0-9]{5,15}$/) && newData.child('text').isString() && newData.child('text').val().length <= 500 && (!newData.child('btn').exists() || (newData.child('btn/t').isString() && newData.child('btn/t').val().length <= 40))"
+      }
+    },
+    "users": {
+      "$uid": {
+        ".read": "auth != null && auth.uid == $uid",
+        ".write": "auth != null && auth.uid == $uid"
+      }
+    }
+  }
+}
