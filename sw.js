@@ -1,5 +1,5 @@
 /* ZINDAGI service worker: оболочка приложения работает офлайн, запросы к Telegram/Firebase не трогаем */
-const VER = 'zindagi-v5';
+const VER = 'zindagi-v8';
 const SHELL = ['./', 'index.html', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png', 'maskable-512.png', 'apple-touch-icon.png'];
 
 self.addEventListener('install', e => {
