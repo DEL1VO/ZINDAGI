@@ -1038,11 +1038,27 @@ const pct=g=>Math.min(100,Math.floor(g.currentAmount/g.targetAmount*100));
 function log(cat,text,ai=false,icon='check'){DB.activity=DB.activity||[];DB.activity.unshift({id:uid(),ts:Date.now(),cat,ai:!!ai,icon,text});DB.activity=DB.activity.slice(0,200)}
 function commit(){save();if(UI.phase==='app'&&UI.route!=='ai')render()}
 
+/* ---- Бюджеты по категориям и быстрые расходы ---- */
+const monthStart=()=>{const n=new Date();return new Date(n.getFullYear(),n.getMonth(),1).getTime()};
+const monthSpent=c=>sum((DB.expenses||[]).filter(e=>e.category===c&&e.ts>=monthStart()));
+function budgetCheck(e){const lim=(DB.budgets||{})[e.category];if(!(lim>0))return;const sp=monthSpent(e.category),p=sp/lim*100,lvl=p>=100?100:p>=80?80:0;if(!lvl)return;
+  DB.budgetAlerts=DB.budgetAlerts||{};const k=curMonth()+':'+e.category;if((DB.budgetAlerts[k]||0)>=lvl)return;DB.budgetAlerts[k]=lvl;const c=CATS[e.category]||CATS.other;
+  const msg=lvl===100?`🚨 Бюджет «${c.n}» превышен: ${money(sp)} из ${money(lim)}`:`⚠️ Бюджет «${c.n}»: потрачено ${Math.round(p)}% (${money(sp)} из ${money(lim)})`;tgNotify(msg);setTimeout(()=>toast(msg,{plain:true}),400)}
+function catSheet({title,cat,note,label,ph,val,hint,onSave}){
+  openSheet(`<h2 class="sh-h">${esc(title)}</h2>${hint?`<p class="sh-p">${esc(hint)}</p>`:''}<div class="fld"><span>Категория</span><div class="chips scroll" data-chips="cat">${Object.entries(CATS).map(([k,c])=>`<button type="button" class="chip" aria-pressed="${k===cat}" data-v="${k}">${ic(c.i)}${c.n}</button>`).join('')}</div></div>
+  ${note?`<label class="fld"><span>Название</span><input class="inp" id="f_tn" placeholder="Например: Такси" autocomplete="off"></label>`:''}
+  <label class="fld"><span>${esc(label)}</span><input class="inp" id="f_ta" inputmode="decimal" placeholder="${esc(ph)}" value="${val||''}" autocomplete="off"></label><div class="ferr" role="alert" data-err></div><button class="btn pri blk" data-submit>Сохранить</button>`,{mount(sh){
+    const run=()=>{const c=$('[data-chips="cat"] [aria-pressed="true"]',sh).dataset.v,a=parseFloat($('#f_ta',sh).value.replace(/\s/g,'').replace(',','.')),n=note?$('#f_tn',sh).value.trim():'';
+      const r=onSave({cat:c,amt:isNaN(a)?-1:a,note:n});if(typeof r==='string'){$('[data-err]',sh).textContent=r;return}closeSheet()};
+    $('[data-submit]',sh).onclick=run;sh.addEventListener('keydown',e=>{if(e.key==='Enter'&&e.target.tagName==='INPUT')run()})}})}
+const quickHTML=()=>{const T=DB.templates||[];return`<div class="sec"><h2>Быстрые расходы</h2>${T.length?'<button data-act="tplEdit">Изменить</button>':''}</div><div class="chips scroll" style="padding:0 var(--pad);margin-bottom:14px">${T.filter(t=>CATS[t.category]).map(t=>`<button class="chip" data-act="tplUse" data-id="${t.id}">${ic(CATS[t.category].i)}${esc(t.note)} · ${num(t.amount)} с.</button>`).join('')}<button class="chip" data-act="tplAdd">${ic('plus')}Шаблон</button></div>`};
+
+
 /* ============ mutations (the same functions the AI tools call) ============ */
 const M={
-  addExpense(a,ai){const cat=CATS[a.category]?a.category:'other';const e={id:uid(),userId:DB.user.id,amount:+a.amount,currency:'TJS',category:cat,merchant:'',note:a.note||CATS[cat].n,receiptUrl:'',ts:a.ts||Date.now()};
-    DB.expenses.push(e);log('money','Расход: '+e.note+' '+money(-e.amount),ai,'up');tgNotify(`💸 Расход: ${e.note} ${money(-e.amount)}\nБаланс: ${money(balance())}`);commit();return e},
-  addIncome(a,ai){const cat=ICATS[a.category]?a.category:'other';const e={id:uid(),amount:+a.amount,currency:'TJS',category:cat,note:a.note||ICATS[cat].n,ts:a.ts||Date.now()};
+  addExpense(a,ai){const cat=CATS[a.category]?a.category:'other';const e={id:uid(),userId:DB.user.id,amount:+a.amount,currency:'TJS',category:cat,merchant:'',note:a.note||CATS[cat].n,receiptUrl:'',accountId:a.accountId||'',ts:a.ts||Date.now()};
+    DB.expenses.push(e);log('money','Расход: '+e.note+' '+money(-e.amount),ai,'up');budgetCheck(e);tgNotify(`💸 Расход: ${e.note} ${money(-e.amount)}\nБаланс: ${money(balance())}`);commit();return e},
+  addIncome(a,ai){const cat=ICATS[a.category]?a.category:'other';const e={id:uid(),amount:+a.amount,currency:'TJS',category:cat,note:a.note||ICATS[cat].n,accountId:a.accountId||'',ts:a.ts||Date.now()};
     DB.incomes.push(e);log('money','Доход: '+e.note+' '+money(e.amount,{sign:true}),ai,'down');tgNotify(`💰 Доход: ${e.note} ${money(e.amount,{sign:true})}\nБаланс: ${money(balance())}`);commit();return e},
   addGoal(a,ai){const g={id:uid(),name:a.name,targetAmount:+a.target,currentAmount:+a.current||0,currency:'TJS',deadline:a.deadline||0,createdAt:Date.now()};
     DB.goals.push(g);log('money','Добавлена цель «'+g.name+'»',ai,'target');tgNotify(`🎯 Новая цель: «${g.name}» — ${money(g.targetAmount)}`);commit();return g},
@@ -1106,21 +1122,27 @@ function amountSheet(kind){
   openSheet(`<h2 class="sh-h">${isExp?'Новый расход':'Пополнить баланс'}</h2>
   <div class="amtbox"><input id="f_amt" inputmode="decimal" placeholder="0" aria-label="Сумма" data-focus autocomplete="off"><span>с.</span></div>
   <div class="ferr" role="alert" data-err></div>
+  <div class="chips" data-chips="cur" style="margin:-4px 0 12px">${CURS.map(c=>`<button type="button" class="chip" aria-pressed="${c==='TJS'}" data-v="${c}">${c}</button>`).join('')}</div>
   <div class="fld"><span>Категория</span><div class="chips scroll" data-chips="cat">${Object.entries(cats).map(([k,c],i)=>`<button type="button" class="chip" aria-pressed="${i===0}" data-v="${k}">${ic(c.i)}${c.n}</button>`).join('')}</div></div>
   <label class="fld"><span>${isExp?'Комментарий':'Источник'}</span><input class="inp" id="f_note" placeholder="${isExp?'На что потрачено?':'Например: зарплата'}" autocomplete="off"></label>
   <div class="fld"><span>Дата</span><div class="chips" data-chips="day"><button type="button" class="chip" aria-pressed="true" data-v="0">Сегодня</button><button type="button" class="chip" aria-pressed="false" data-v="1">Вчера</button></div></div>
+  ${(DB.accounts||[]).length?`<div class="fld"><span>Счёт</span><div class="chips scroll" data-chips="acc">${[{id:'',name:'Без счёта'},...DB.accounts].map(a=>`<button type="button" class="chip" aria-pressed="${a.id===accNorm(DB.lastAcc||'')}" data-v="${a.id}">${esc(a.name)}</button>`).join('')}</div></div>`:''}
+  
   ${isExp?`<button class="btn line blk" style="margin-bottom:10px" data-scan>${ic('scan')}<span>Сканировать чек</span></button><input type="file" accept="image/*" capture="environment" hidden id="f_scan"><div class="small" data-scanmsg style="margin:-2px 0 12px"></div>`:''}
   <button class="btn pri blk" data-submit>Сохранить</button>`,{mount(sh){
-    const amt=$('#f_amt',sh);numSan(amt);const fit=()=>{amt.style.width=Math.max(1,amt.value.length||1)+'ch'};amt.addEventListener('input',fit);fit();
-    if(isExp){const file=$('#f_scan',sh),sb=$('[data-scan]',sh);sb.onclick=()=>file.click();
-      file.onchange=()=>{if(!file.files[0])return;$('span',sb).textContent='Анализируем чек…';sb.disabled=true;
-        setTimeout(()=>{sb.disabled=false;$('span',sb).textContent='Сканировать чек';amt.value='186';$('#f_note',sh).value='Магазин: молоко, хлеб, фрукты';
-          $$('[data-chips="cat"] .chip',sh).forEach(c=>c.setAttribute('aria-pressed',c.dataset.v==='food'));
-          $('[data-scanmsg]',sh).textContent='Демо: значения подставлены как пример. В рабочей версии чек распознаёт /ai/analyze-receipt — проверьте данные перед сохранением.'},1200)}}
+    loadRates();const amt=$('#f_amt',sh);numSan(amt);const fit=()=>{amt.style.width=Math.max(1,amt.value.length||1)+'ch'};amt.addEventListener('input',fit);fit();
+    if(isExp){const file=$('#f_scan',sh),sb=$('[data-scan]',sh),msg=$('[data-scanmsg]',sh);sb.onclick=()=>{if(!cloudOn()){msg.textContent='Для сканирования нужен вход в аккаунт и интернет.';return}file.click()};
+      file.onchange=async()=>{const f=file.files[0];if(!f)return;const lab=$('span',sb);lab.textContent='Читаем чек…';sb.disabled=true;msg.textContent='';
+        try{const r=await scanReceipt(f);amt.value=String(r.amount);amt.dispatchEvent(new Event('input'));$('#f_note',sh).value=r.note||'';
+          $$('[data-chips="cat"] .chip',sh).forEach(c=>c.setAttribute('aria-pressed',c.dataset.v===r.category));$$('[data-chips="cur"] .chip',sh).forEach(c=>c.setAttribute('aria-pressed',c.dataset.v===r.currency));
+          msg.textContent='Чек распознан — проверьте данные перед сохранением.'}catch(e){msg.textContent=(e&&e.message&&!/^(offline|timeout|scan|error)$/.test(e.message))?e.message:'Не удалось распознать чек. Попробуйте ещё раз или введите сумму вручную.'}
+        lab.textContent='Сканировать чек';sb.disabled=false;file.value=''}}
     const run=()=>{const v=parseFloat(amt.value);if(!(v>0)){$('[data-err]',sh).textContent='Введите сумму больше 0';amt.focus();return}
       const cat=$('[data-chips="cat"] [aria-pressed="true"]',sh).dataset.v,day=$('[data-chips="day"] [aria-pressed="true"]',sh).dataset.v,note=$('#f_note',sh).value.trim();
       const ts=day==='1'?Date.now()-DAY:Date.now();
-      if(isExp){M.addExpense({amount:v,category:cat,note,ts});toast('Расход сохранён')}else{M.addIncome({amount:v,category:cat,note,ts});toast('Баланс пополнен')}
+      const ac=$('[data-chips="acc"] [aria-pressed="true"]',sh),accountId=ac?ac.dataset.v:'';if(ac)DB.lastAcc=accountId;
+      const cur=($('[data-chips="cur"] [aria-pressed="true"]',sh)||{dataset:{v:'TJS'}}).dataset.v,amount=cur==='TJS'?v:Math.round(v*curRate(cur)*100)/100,note2=cur==='TJS'?note:(note?note+' ':'')+'('+v+' '+cur+')';
+      if(isExp){M.addExpense({amount,category:cat,note:note2,ts,accountId});toast('Расход сохранён')}else{M.addIncome({amount,category:cat,note:note2,ts,accountId});toast('Баланс пополнен')}
       closeSheet()};
     $('[data-submit]',sh).onclick=run;sh.addEventListener('keydown',e=>{if(e.key==='Enter'&&e.target.tagName==='INPUT')run()})}})}
 
@@ -1249,6 +1271,9 @@ const newStartToken=()=>{const a=new Uint8Array(16);try{crypto.getRandomValues(a
    В обычном браузере пробуем открыть новую вкладку, а если её заблокировали — тоже переходим напрямую. */
 function openTgLink(link){
   if(PWA.inApp()){location.href=link;return}
+  /* tg://resolve открывает приложение Telegram сразу, без пустого окна браузера; страница остаётся на месте и ждёт код */
+  const m=/^https:\/\/t\.me\/([A-Za-z0-9_]+)(?:\?start=(.*))?$/.exec(link);
+  if(m){try{location.href='tg://resolve?domain='+m[1]+(m[2]?'&start='+m[2]:'');return}catch(e){}}
   try{const w=window.open(link,'_blank','noopener');if(!w)location.href=link}catch(e){location.href=link}
 }
 let FB=null;
@@ -1565,7 +1590,7 @@ function authTg(A){
       <div class="center small" id="t_info" style="margin-top:14px"></div>
       <div class="center"><button class="link" id="t_re"></button></div>`
     :live||REG.viaBot?`<p class="lead">Откройте бота и нажмите «Start». Код придёт в чат, а эта страница обновится сама.</p>
-      <a class="btn pri blk" id="t_link" href="${esc(REG.link)}" target="_blank" rel="noopener">${ic('telegram')}Открыть Telegram</a>
+      <a class="btn pri blk" id="t_link" href="${esc(REG.link)}" rel="noopener">${ic('telegram')}Открыть Telegram</a>
       <div class="msgline" id="t_st" role="status" style="margin-top:16px">Ждём, пока вы нажмёте Start в боте…</div>`
     :`<p class="lead">Откройте Telegram Bot, чтобы получить код.</p>
       <div class="card" style="margin:0 0 18px;display:flex;gap:14px;align-items:center"><span class="ico" style="--c:#2F8FE0;width:52px;height:52px;border-radius:16px">${ic('telegram')}</span><div class="small" style="font-size:14px">Бот свяжет ваш Telegram с этой регистрацией по одноразовой ссылке и пришлёт 6-значный код.</div></div>
@@ -1576,7 +1601,7 @@ function authTg(A){
     if(REG.viaBot){
       const st=$('#t_st',A),t0=Date.now();let busy=false,dead=false,timer;
       const fail=m=>{st.textContent=m;st.classList.add('bad');stop()};
-      const stop=()=>{dead=true;clearTimeout(timer);document.removeEventListener('visibilitychange',vis)};
+      const stop=()=>{dead=true;clearTimeout(timer);document.removeEventListener('visibilitychange',vis);window.removeEventListener('focus',vis);window.removeEventListener('pageshow',vis)};
       const tick=async()=>{if(dead||busy)return;
         if(!st.isConnected||UI.phase!=='tg'){stop();return}
         if(Date.now()-t0>10*MIN)return fail('Ссылка устарела. Вернитесь назад и начните заново.');
@@ -1590,6 +1615,7 @@ function authTg(A){
                 stop();renderAuth();return}}
             else{stop();st.classList.add('bad');
               if(m.status==='phone_taken')st.textContent='Номер '+maskPhone(REG.phone,REG.cc)+' уже привязан к другому Telegram-аккаунту. Войдите с того Telegram.'+(m.hint?' Этот Telegram привязан к номеру '+m.hint+'.':' Нет доступа к нему? Нажмите «Нет доступа к Telegram» в чате с ботом.');
+              else if(m.status==='blocked')st.textContent='Аккаунт заблокирован по запросу владельца. Откройте бота @'+BOT_USERNAME+' и нажмите «Связаться со службой поддержки».';
               else if(m.status==='tg_has_other')st.textContent='Этот Telegram уже привязан к номеру '+m.hint+'. Укажите именно этот номер.';
               else if(m.status==='not_found'){st.innerHTML='Аккаунт с номером '+esc(maskPhone(REG.phone,REG.cc))+' не найден. <button class="link" id="t_reg" style="min-height:32px;padding:0">Зарегистрироваться</button>';$('#t_reg',A).onclick=()=>setPhase('welcome')}
               else st.textContent='Ссылка недействительна. Вернитесь назад и начните заново.';
@@ -1597,7 +1623,9 @@ function authTg(A){
         catch(e){if(e.status===401||e.status===403)return fail('Нет доступа к серверу входа. Администратору нужно обновить правила Firebase.')}
         busy=false;clearTimeout(timer);timer=setTimeout(tick,2000)};
       const vis=()=>{if(!document.hidden){clearTimeout(timer);tick()}};
-      document.addEventListener('visibilitychange',vis);timer=setTimeout(tick,1500);return}
+      document.addEventListener('visibilitychange',vis);window.addEventListener('focus',vis);window.addEventListener('pageshow',vis);
+      const tl=$('#t_link',A);if(tl)tl.onclick=e=>{e.preventDefault();openTgLink(REG.link)};
+      timer=setTimeout(tick,1500);return}
     if(!live){$('#t_open',A).onclick=async()=>{openTgLink('https://t.me/'+BOT_USERNAME);await sendOtp();renderAuth()};return}
     const st=$('#t_st',A);
     const poll=async()=>{if(!st.isConnected||UI.phase!=='tg')return;
@@ -1675,7 +1703,49 @@ function authLock(A){
   $('#l_out',A).onclick=()=>confirmSheet({title:'Выйти из аккаунта?',text:DB.user&&DB.user.tgChat?'Данные сохранятся на этом устройстве. Чтобы вернуться, нажмите «Войти» и подтвердите Telegram — заодно создадите новый PIN.':'Данные на этом устройстве будут удалены. Войти можно будет через новую регистрацию.',ok:'Выйти',danger:true,onOk:async()=>{if(cloudOn()&&syDirty().length){toast('Сохраняем данные перед выходом…',{plain:true});try{await syncNow(true)}catch(e){}}resetAll()}})}
 
 /* ============ screens ============ */
-const SCREENS={};
+const SCREENS={}
+SCREENS.budgets=()=>{const B=DB.budgets||{},ks=Object.keys(B).filter(k=>CATS[k]&&B[k]>0);
+  return`<div class="screen">${head('Бюджеты',{back:true,right:plusBtn('setBudget','Добавить бюджет')})}
+  ${ks.length?`<p class="muted" style="margin:0 var(--pad) 12px;font-size:14px">Лимиты на текущий месяц. Когда потрачено 80% и 100%, придёт сообщение в Telegram.</p>`+ks.map(k=>{const c=CATS[k],lim=B[k],sp=monthSpent(k),r=sp/lim,p=Math.min(100,Math.round(r*100)),col=r>=1?'#E5484D':r>=.8?'#F0A92E':'';
+    return`<button class="card" data-act="setBudget" data-cat="${k}" style="display:block;width:calc(100% - 2 * var(--pad));text-align:left"><div style="display:flex;justify-content:space-between;gap:8px;margin-bottom:10px"><b>${c.n}</b><b class="num">${Math.round(r*100)}%</b></div>
+    <div class="bar" role="progressbar" aria-valuenow="${p}" aria-valuemin="0" aria-valuemax="100" aria-label="${c.n}"><i style="--w:${p}%;${col?'background:'+col:''}"></i></div>
+    <div class="meta"><span>Потрачено ${num(sp)} с.</span><span>${r>=1?'Превышено на '+num(sp-lim):'Осталось '+num(lim-sp)} с.</span></div></button>`}).join(''):empty('target','Бюджетов пока нет','Задайте лимит на категорию, например «Еда — 1500 с. в месяц», и следите за прогрессом.',`<button class="btn pri sm" data-act="setBudget">${ic('plus')}Добавить бюджет</button>`)}</div>`};
+/* ---- AI через сервер (OpenRouter): запрос уходит в Firebase, ответ приходит от бота ---- */
+async function aiCall(kind,payload,ms=45000){const u=FB&&FB.auth&&FB.auth.currentUser;if(!u||!cloudOn())throw new Error('offline');const id=uid()+uid(),rs=FB.db.ref('airesp/'+u.uid+'/'+id);
+  const done=new Promise((res,rej)=>{const t=setTimeout(()=>{rs.off();rej(new Error('timeout'))},ms);rs.on('value',sn=>{const v=sn.val();if(v){clearTimeout(t);rs.off();rs.remove().catch(()=>{});res(v)}})});
+  await FB.db.ref('aireq/'+u.uid+'/'+id).set({kind,ts:Date.now(),...payload});return done}
+function aiContext(){const ex=lastDays(DB.expenses||[],30),prev=(DB.expenses||[]).filter(e=>e.ts>=sod()-59*DAY&&e.ts<sod()-29*DAY),t=totals(),cats=byCat(ex).slice(0,6).map(r=>(CATS[r.k]||CATS.other).n+' '+Math.round(r.v)).join(', ');
+  return`Сегодня ${iso(Date.now())}. Баланс: ${Math.round(t.inc-t.exp)} с. Расходы за 30 дней: ${Math.round(sum(ex))} с. (предыдущие 30 дней: ${Math.round(sum(prev))} с.). По категориям: ${cats||'нет'}. Бюджеты месяца (потрачено/лимит): ${Object.entries(DB.budgets||{}).map(([k,v])=>(CATS[k]||CATS.other).n+' '+Math.round(monthSpent(k))+'/'+v).join(', ')||'нет'}. Цели: ${(DB.goals||[]).map(g=>g.name+' '+Math.round(g.currentAmount)+'/'+Math.round(g.targetAmount)+(g.deadline?' до '+iso(g.deadline):'')).join('; ')||'нет'}. Невыполненных задач: ${(DB.tasks||[]).filter(x=>!x.completed).length}.`}
+async function llmChat(q){const hist=UI.chat.slice(-9,-1).filter(m=>!m.first).map(m=>({role:m.me?'user':'assistant',content:String(m.text).slice(0,400)}));
+  const r=await aiCall('chat',{q:q.slice(0,500),ctx:aiContext().slice(0,1800),...(hist.length?{hist}:{})});if(!r.ok)throw new Error(r.err||'ai');return r.text}
+async function scanReceipt(file){const img=await createImageBitmap(file),sc=Math.min(1,1000/Math.max(img.width,img.height)),c=document.createElement('canvas');c.width=Math.round(img.width*sc);c.height=Math.round(img.height*sc);c.getContext('2d').drawImage(img,0,0,c.width,c.height);
+  const r=await aiCall('receipt',{img:c.toDataURL('image/jpeg',.7)},60000);if(!r.ok)throw new Error(r.err||'scan');return r}
+/* ---- валюты ---- */
+const CURS=['TJS','RUB','USD','UZS'],RATE_DEF={TJS:1,RUB:.12,USD:9.5,UZS:.00077};
+const curRate=c=>c==='TJS'?1:((DB.rates&&DB.rates[c])||RATE_DEF[c]||1);
+async function loadRates(){try{if(DB.rates&&Date.now()-DB.rates.ts<12*3600*1000)return;const r=await fetch('https://open.er-api.com/v6/latest/USD'),j=await r.json(),x=j.rates;if(!x||!x.TJS)return;DB.rates={ts:Date.now(),USD:x.TJS,RUB:x.TJS/x.RUB,UZS:x.TJS/x.UZS};save()}catch(e){}}
+/* ---- общие расходы (кто сколько потратил и кто кому должен) ---- */
+const splitMembers=()=>{const m=(DB.split&&DB.split.members)||[];return m.length?m:['Я']};
+function splitBalances(){const b=Object.fromEntries(splitMembers().map(n=>[n,0]));(DB.shared||[]).filter(x=>!x.settled).forEach(x=>{const part=x.amount/x.with.length;b[x.payer]=(b[x.payer]||0)+x.amount;x.with.forEach(n=>b[n]=(b[n]||0)-part)});return b}
+function splitDebts(){const cr=[],de=[];Object.entries(splitBalances()).forEach(([n,v])=>{if(v>.5)cr.push([n,v]);else if(v<-.5)de.push([n,-v])});cr.sort((a,b)=>b[1]-a[1]);de.sort((a,b)=>b[1]-a[1]);const out=[];let i=0,j=0;
+  while(i<cr.length&&j<de.length){const a=Math.min(cr[i][1],de[j][1]);out.push({from:de[j][0],to:cr[i][0],a});cr[i][1]-=a;de[j][1]-=a;if(cr[i][1]<.5)i++;if(de[j][1]<.5)j++}return out}
+SCREENS.split=()=>{const M2=splitMembers(),sh=(DB.shared||[]).slice().sort((a,b)=>b.ts-a.ts).slice(0,20),debts=splitDebts(),open=(DB.shared||[]).some(x=>!x.settled);
+  return`<div class="screen">${head('Общие расходы',{back:true,right:plusBtn('addShared','Добавить общий расход')})}
+  <div class="card"><div class="t1" style="margin-bottom:8px">Участники</div><div class="chips">${M2.map(n=>`<span class="chip">${esc(n)}</span>`).join('')}<button class="chip" data-act="addMember">${ic('plus')}Добавить</button></div></div>
+  <div class="card"><div class="t1" style="margin-bottom:8px">Кто кому должен</div>${debts.length?debts.map(d=>`<div style="display:flex;justify-content:space-between;gap:8px;padding:6px 0"><span>${esc(d.from)} → ${esc(d.to)}</span><b class="num">${num(d.a)} с.</b></div>`).join('')+`<button class="btn pri sm" style="margin-top:10px" data-act="settleShared">Рассчитались</button>`:'<p class="muted" style="margin:0">Долгов нет — все в расчёте.</p>'}</div>
+  ${sh.length?`<div class="sec"><h2>История</h2></div><div class="list">${sh.map(x=>`<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:12px 16px"><div><div class="t1" style="font-size:15px">${esc(x.note||'Общий расход')}${x.settled?' ✓':''}</div><div class="t2">Платил(а): ${esc(x.payer)} · на ${x.with.length}</div></div><div style="text-align:right"><b class="num">${num(x.amount)} с.</b><br><button class="link" style="min-height:30px" data-act="delShared" data-id="${x.id}">Удалить</button></div></div>`).join('')}</div>`:empty('family','Общих расходов нет','Добавьте участников и записывайте, кто за что заплатил — приложение посчитает, кто кому должен.',`<button class="btn pri sm" data-act="addShared">${ic('plus')}Добавить расход</button>`)}</div>`};
+const accIds=()=>new Set((DB.accounts||[]).map(a=>a.id));
+const accNorm=v=>accIds().has(v)?v:'';
+const accBal=id=>{const S=(l,f)=>sum((l||[]).filter(x=>accNorm(x[f]||'')===id));return S(DB.incomes,'accountId')-S(DB.expenses,'accountId')+S(DB.transfers,'to')-S(DB.transfers,'from')};
+SCREENS.accounts=()=>{const A=DB.accounts||[];
+  return`<div class="screen">${head('Счета',{back:true,right:plusBtn('addAccount','Новый счёт')})}
+  <section class="fsum"><div class="lbl">Всего на всех счетах</div><div class="big">${DB.hide?'••••':num(balance())} <span class="muted" style="font-size:.55em">с.</span></div>${A.length?`<div class="two"><button class="btn pri sm" data-act="transfer">Перевод</button><button class="btn line sm" data-act="addAccount">${ic('plus')}Счёт</button></div>`:''}</section>
+  ${A.length?[{id:'',name:'Без счёта'},...A].map(a=>`<article class="card"><div style="display:flex;justify-content:space-between;gap:10px"><b>${esc(a.name)}</b><b class="num">${DB.hide?'••••':num(accBal(a.id))} с.</b></div>${a.id?`<button class="link" data-act="delAccount" data-id="${a.id}" style="min-height:36px;margin-top:6px">Удалить</button>`:''}</article>`).join(''):empty('wallet','Счетов пока нет','Добавьте наличные, карту или кошелёк — у каждого будет свой баланс, а между ними можно делать переводы.',`<button class="btn pri sm" data-act="addAccount">${ic('plus')}Добавить счёт</button>`)}</div>`};
+const habitStreak=h=>{const d=new Set(h.days||[]);let n=0,t=sod();if(!d.has(iso(t)))t-=DAY;while(d.has(iso(t))){n++;t-=DAY}return n};
+SCREENS.habits=()=>{const H=DB.habits||[],td=iso(Date.now());
+  return`<div class="screen">${head('Привычки',{back:true,right:plusBtn('addHabit','Новая привычка')})}${H.length?H.map(h=>{const on=(h.days||[]).includes(td),n=habitStreak(h);
+    return`<article class="card"><div style="display:flex;justify-content:space-between;align-items:center;gap:10px"><div><div class="t1">${esc(h.name)}</div><div class="t2">🔥 Серия: ${n} ${pl(n,['день','дня','дней'])}</div></div><button class="btn ${on?'line':'pri'} sm" data-act="habitDay" data-id="${h.id}">${on?'Выполнено ✓':'Отметить'}</button></div><button class="link" data-act="delHabit" data-id="${h.id}" style="min-height:36px;margin-top:8px">Удалить</button></article>`}).join(''):empty('tasks','Привычек пока нет','Добавьте привычку и отмечайте её каждый день — серия дней будет расти.',`<button class="btn pri sm" data-act="addHabit">${ic('plus')}Добавить привычку</button>`)}</div>`};
+;
 const head=(title,{back=false,right=''}={})=>`<header class="ph">${back?`<button class="ib" data-act="back" aria-label="Назад">${ic('back')}</button>`:''}<h1>${esc(title)}</h1><div class="ph-r">${right}</div></header>`;
 const plusBtn=(act,label)=>`<button class="ib" data-act="${act}" aria-label="${esc(label)}">${ic('plus')}</button>`;
 const empty=(i,t,p,btn='')=>`<div class="empty"><div class="ei">${ic(i)}</div><h3>${esc(t)}</h3><p>${esc(p)}</p>${btn}</div>`;
@@ -1685,7 +1755,7 @@ const opRow=(o,del=false)=>{const c=catOf(o),inc=o.kind==='inc';
 const groupByDay=(items,fn)=>{const g=[];items.forEach(x=>{const d=sod(fn(x));const l=g[g.length-1];if(l&&l.d===d)l.items.push(x);else g.push({d,items:[x]})});return g};
 const SERVICES=[{id:'money',n:'Деньги',i:'wallet',t:'g',to:'finance'},{id:'expenses',n:'Расходы',i:'chart',t:'s',to:'expenses'},{id:'tasks',n:'Задачи',i:'tasks',t:'t',to:'tasks'},{id:'goals',n:'Цели',i:'target',t:'y',to:'goals'},
   {id:'docs',n:'Документы',i:'doc',t:'s',to:'documents'},{id:'shop',n:'Покупки',i:'bag',t:'l',to:'shopping'},{id:'cal',n:'Календарь',i:'cal',t:'t',to:'calendar'},{id:'more',n:'Ещё',i:'grid',t:'n',act:'more'}];
-const MORE=[{id:'family',n:'Семья',i:'family',to:'family',t:'g'},{id:'reminders',n:'Напоминания',i:'bell',to:'reminders',t:'y'},{id:'ai',n:'AI',i:'spark',to:'ai',t:'g'},{id:'analytics',n:'Аналитика',i:'trend',to:'analytics',t:'s'},
+const MORE=[{id:'split',n:'Общие расходы',i:'family',to:'split',t:'l'},{id:'accounts',n:'Счета',i:'wallet',to:'accounts',t:'s'},{id:'habits',n:'Привычки',i:'tasks',to:'habits',t:'t'},{id:'budgets',n:'Бюджеты',i:'target',to:'budgets',t:'y'},{id:'family',n:'Семья',i:'family',to:'family',t:'g'},{id:'reminders',n:'Напоминания',i:'bell',to:'reminders',t:'y'},{id:'ai',n:'AI',i:'spark',to:'ai',t:'g'},{id:'analytics',n:'Аналитика',i:'trend',to:'analytics',t:'s'},
   {id:'subs',n:'Подписки',i:'repeat',to:'recurring',p:{kind:'sub'},t:'t'},{id:'bills',n:'Платежи',i:'card',to:'recurring',p:{kind:'bill'},t:'l'},{id:'debts',n:'Долги',i:'swap',to:'debts',t:'y'},
   {id:'incomes',n:'Доходы',i:'down',to:'incomes',t:'g'},{id:'favs',n:'Избранное',i:'star',to:'favorites',t:'y'},{id:'settings',n:'Настройки',i:'sliders',to:'profile',t:'n'}];
 const svcBtn=(s,star)=>`<button class="svc tn-${s.t}" data-act="${s.act||'nav'}" ${s.to?`data-to="${s.to}"`:''} ${s.p?`data-p='${JSON.stringify(s.p)}'`:''}>${star&&(DB.favs||[]).includes(s.id)?ic('star','star'):''}<span class="tl">${ic(s.i)}</span>${s.n}</button>`;
@@ -1705,6 +1775,7 @@ SCREENS.home=()=>{
   <div class="sec"><h2>Сервисы</h2></div><div class="grid4">${SERVICES.map(s=>svcBtn(s,true)).join('')}</div>
   <section class="aic">${orbSVG}<h3>${ic('spark')}ZINDAGI AI</h3><p>Я помогу контролировать ваши деньги, задачи и цели.</p>
     ${ins.map(i=>`<button class="ins" data-act="aiAsk" data-q="${esc(i.q)}">${ic(i.i)}<span>${esc(i.t)}</span></button>`).join('')}<button class="btn pri sm" data-act="nav" data-to="ai">Спросить AI</button></section>
+  ${quickHTML()}
   <div class="sec"><h2>Последние операции</h2><button data-act="nav" data-to="activity" data-p='{"filter":"money"}'>Все</button></div>
   ${ops.length?`<div class="list">${ops.map(o=>opRow(o)).join('')}</div>`:empty('wallet','Операций пока нет','Добавьте первый расход или доход — баланс обновится сразу.',`<button class="btn pri sm" data-act="addExpense">${ic('plus')}Добавить расход</button>`)}
   </div>`,mount(h){const el=$('[data-bal]',h);if(el&&!DB.hide){countUp(el,UI.shownBal==null?0:UI.shownBal,b);UI.shownBal=b}}}};
@@ -1726,7 +1797,7 @@ SCREENS.finance=()=>{
   <section class="fsum"><div class="lbl">Общий баланс</div><div class="big">${DB.hide?'••••':num(t.inc-t.exp)} <span class="muted" style="font-size:.55em">с.</span></div>
     <div class="pair"><div class="pill in"><span class="pi">${ic('down')}</span><div><small>Доходы</small><b>+${num(t.inc)} с.</b></div></div><div class="pill out"><span class="pi">${ic('up')}</span><div><small>Расходы</small><b>−${num(t.exp)} с.</b></div></div></div>
     <div class="two"><button class="btn pri sm" data-act="addExpense">${ic('plus')}Расход</button><button class="btn line sm" data-act="addIncome">${ic('plus')}Доход</button></div></section>
-  <div class="chips" style="margin-bottom:14px">${[['Доходы','incomes','down'],['Подписки','recurring','repeat'],['Платежи','recurring','card'],['Долги','debts','swap'],['Аналитика','analytics','trend']].map(([l,to,i])=>`<button class="chip" data-act="nav" data-to="${to}" ${l==='Подписки'?`data-p='{"kind":"sub"}'`:l==='Платежи'?`data-p='{"kind":"bill"}'`:''}>${ic(i)}${l}</button>`).join('')}</div>
+  <div class="chips" style="margin-bottom:14px">${[['Счета','accounts','wallet'],['Бюджеты','budgets','target'],['Доходы','incomes','down'],['Подписки','recurring','repeat'],['Платежи','recurring','card'],['Долги','debts','swap'],['Аналитика','analytics','trend']].map(([l,to,i])=>`<button class="chip" data-act="nav" data-to="${to}" ${l==='Подписки'?`data-p='{"kind":"sub"}'`:l==='Платежи'?`data-p='{"kind":"bill"}'`:''}>${ic(i)}${l}</button>`).join('')}</div>
   <div class="card"><div class="chart-h"><div><div class="t2">Расходы за ${days===7?'7 дней':'30 дней'}</div><b>${num(tot)} с.</b></div></div>
     <div class="seg" style="margin:10px 0 0"><button data-act="finPeriod" data-v="7" aria-pressed="${days===7}">Неделя</button><button data-act="finPeriod" data-v="30" aria-pressed="${days===30}">Месяц</button></div>${barsSVG(buckets(days))}</div>
   <div class="sec"><h2>Категории</h2><button data-act="nav" data-to="expenses">Все расходы</button></div>
@@ -1837,7 +1908,7 @@ SCREENS.analytics=()=>{const ex=lastDays(DB.expenses||[],30),tot=sum(ex),rows=by
   return`<div class="screen">${head('Аналитика',{back:true})}
   <div class="kpis"><div class="kpi"><small>Тратите в день</small><b>${num(tot/30)} с.</b><small>в среднем за 30 дней</small></div><div class="kpi"><small>Остаётся от дохода</small><b>${rate}%</b><small>норма сбережений</small></div>
     <div class="kpi"><small>Задачи</small><b>${done} из ${tasks.length}</b><small>выполнено</small></div><div class="kpi"><small>Цели</small><b>${avgG}%</b><small>средний прогресс</small></div></div>
-  <div class="card"><div class="t1" style="margin-bottom:10px">Куда уходят деньги</div>${rows.length?donutSVG(rows,tot)+`<div style="margin-top:10px">${catRows(rows,tot)}</div>`:'<p class="muted">Пока нет данных.</p>'}</div></div>`};
+  <div class="card"><div class="t1" style="margin-bottom:10px">Куда уходят деньги</div>${rows.length?donutSVG(rows,tot)+`<div style="margin-top:10px">${catRows(rows,tot)}</div>`:'<p class="muted">Пока нет данных.</p>'}</div><div style="padding:0 var(--pad)"><button class="btn line blk" data-act="exportReport">Скачать отчёт за 30 дней (Excel)</button><button class="btn line blk" style="margin-top:8px" data-act="exportPDF">Отчёт в PDF</button></div></div>`};
 
 /* ---- Recurring (subscriptions & bills) ---- */
 const curMonth=()=>{const n=new Date();return n.getFullYear()+'-'+pad(n.getMonth()+1)};
@@ -2029,7 +2100,7 @@ SCREENS.ai=()=>{if(!UI.chat.length)UI.chat.push({me:false,text:`Привет, ${
 function pushMsg(m){UI.chat.push(m);const box=$('#msgs');if(box&&UI.route==='ai'){box.insertAdjacentHTML('beforeend',bubbleHTML(m));box.scrollTop=box.scrollHeight}}
 async function aiSend(text,opts={}){text=(text||'').trim();if(!text||UI.busy)return;UI.busy=true;const byVoice=!!opts.voice;pushMsg({me:true,text});const inp=$('#aiInput');if(inp)inp.value='';
   const box=$('#msgs');let ty=null;if(box&&UI.route==='ai'){box.insertAdjacentHTML('beforeend','<div class="b bot typing" aria-label="AI печатает"><i></i><i></i><i></i></div>');ty=box.lastElementChild;box.scrollTop=box.scrollHeight}
-  await sleep(600+Math.random()*450);if(ty)ty.remove();let r;try{r=runAI(text)}catch(e){r={text:'Не получилось выполнить команду. Попробуйте сформулировать иначе.'}}
+  await sleep(600+Math.random()*450);if(ty)ty.remove();let r;const wantLLM=/^(почему|зачем|стоит ли|могу ли|посоветуй|подскажи|объясни|как (мне )?(сэкономить|накопить|уменьшить))|совет|анализ/.test(text.toLowerCase());try{r=wantLLM&&cloudOn()?{text:''}:runAI(text);if(cloudOn()&&(wantLLM||/^Пока я понимаю команды/.test(r.text))){try{r={text:await llmChat(text)}}catch(e){r={text:wantLLM||r.text===''?'AI сейчас недоступен: '+((e&&e.message&&!/^(offline|timeout|ai|error)$/.test(e.message))?e.message:'проверьте интернет и попробуйте позже')+'.':r.text}}}}catch(e){r={text:'Не получилось выполнить команду. Попробуйте сформулировать иначе.'}}
   pushMsg({me:false,text:r.text,card:r.card});UI.busy=false;
   speak(r.text,()=>{if(byVoice&&UI.voiceTurn&&UI.route==='ai'&&aiVoiceOn())aiMic($('#aiMic'))});
   const i2=$('#aiInput');if(i2&&UI.route==='ai'&&!byVoice)i2.focus({preventScroll:true})}
@@ -2093,7 +2164,7 @@ function toggleAiVoice(){DB.aiVoice=!aiVoiceOn();if(!DB.aiVoice){stopSpeak();UI.
 
 /* ============ router ============ */
 const TABS=[['home','Главная','home'],['finance','Финансы','wallet'],['ai','AI','spark'],['activity','Активность','clock'],['profile','Профиль','user']];
-const TAB_OF={home:'home',finance:'finance',expenses:'finance',incomes:'finance',recurring:'finance',debts:'finance',analytics:'finance',ai:'ai',activity:'activity',profile:'profile'};
+const TAB_OF={split:'home',accounts:'finance',habits:'home',budgets:'finance',home:'home',finance:'finance',expenses:'finance',incomes:'finance',recurring:'finance',debts:'finance',analytics:'finance',ai:'ai',activity:'activity',profile:'profile'};
 function renderTabs(){const lk=isLocked(),cur=lk?'':(TAB_OF[UI.route]||'home');$('#tabbar').innerHTML=TABS.map(([r,l,i])=>`<button class="tab" data-act="tab" data-to="${r}" ${r===cur?'aria-current="page"':''}><span class="pl">${ic(i)}${lk?`<span class="lkb">${ic('lock')}</span>`:''}</span>${l}</button>`).join('')}
 function render(){premShown=isLocked();const host=$('#host'),lk=isLocked(),scr=lk?SCREENS.premium:(SCREENS[UI.route]||SCREENS.home),r=scr(UI.params),html=typeof r==='string'?r:r.html,y=UI.enter?0:host.scrollTop;
   host.dataset.enter=UI.enter?'1':'0';host.innerHTML=html;host.scrollTop=y;UI.enter=false;if(typeof r==='object'&&r.mount)r.mount(host);renderTabs()}
@@ -2126,6 +2197,40 @@ function clearData(){['expenses','incomes','goals','tasks','reminders','events',
   DB.lists=['Продукты','Дом','Работа','Личное'].map(n=>({id:uid(),name:n,budget:0,items:[]}));(DB.threads||[]).forEach(t=>{t.unread=0});UI.shownBal=null;UI.shopList=null;save();render()}
 
 const ACT={
+  addMember(){formSheet({title:'Новый участник',fields:[{id:'n',label:'Имя',ph:'Например: Мадина',req:1,msg:'Введите имя',focus:1}],onSubmit:v=>{const m=splitMembers();if(m.includes(v.n))return'Такой участник уже есть';DB.split={...(DB.split||{}),members:[...m,v.n]};commit()}})},
+  addShared(){const M2=splitMembers();if(M2.length<2){toast('Сначала добавьте участников',{plain:true});return ACT.addMember()}
+    openSheet(`<h2 class="sh-h">Общий расход</h2><div class="fld"><span>Кто платил</span><div class="chips scroll" data-chips="payer">${M2.map((n,i)=>`<button type="button" class="chip" aria-pressed="${i===0}" data-v="${esc(n)}">${esc(n)}</button>`).join('')}</div></div><label class="fld"><span>Сумма, с. (делим поровну на всех)</span><input class="inp" id="f_sa" inputmode="decimal" placeholder="300" autocomplete="off"></label><label class="fld"><span>За что</span><input class="inp" id="f_sn" placeholder="Ужин, продукты…" autocomplete="off"></label><div class="ferr" role="alert" data-err></div><button class="btn pri blk" data-submit>Сохранить</button>`,{mount(sh){
+      const run=()=>{const a=parseFloat($('#f_sa',sh).value.replace(/\s/g,'').replace(',','.'));if(!(a>0)){$('[data-err]',sh).textContent='Введите сумму больше 0';return}
+        DB.shared=[...(DB.shared||[]),{id:uid(),payer:$('[data-chips="payer"] [aria-pressed="true"]',sh).dataset.v,amount:a,note:$('#f_sn',sh).value.trim(),with:M2.slice(),ts:Date.now(),settled:false}];commit();closeSheet();toast('Общий расход записан',{plain:true})};
+      $('[data-submit]',sh).onclick=run;sh.addEventListener('keydown',e=>{if(e.key==='Enter'&&e.target.tagName==='INPUT')run()})}})},
+  settleShared(){confirmSheet({title:'Рассчитались?',text:'Все текущие долги будут закрыты. История сохранится.',ok:'Да, рассчитались',onOk:()=>{(DB.shared||[]).forEach(x=>x.settled=true);commit()}})},
+  delShared(t){DB.shared=(DB.shared||[]).filter(x=>x.id!==t.dataset.id);commit()},
+  exportPDF(){const days=30,ex=lastDays(DB.expenses||[],days),inc=lastDays(DB.incomes||[],days),rows=byCat(ex),tot=sum(ex),ops=[...ex.map(e=>({...e,k:'−'})),...inc.map(e=>({...e,k:'+'}))].sort((a,b)=>b.ts-a.ts).slice(0,80);
+    const cn=o=>((o.k==='+'?ICATS:CATS)[o.category]||CATS.other).n,h=`<html><head><meta charset="utf-8"><title>ZINDAGI — отчёт</title><style>body{font:14px Arial,sans-serif;color:#111;padding:24px}h1{font-size:22px;margin:0 0 4px}h2{font-size:16px;margin:18px 0 4px}table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #ddd;padding:6px 4px;text-align:left}.r{text-align:right}</style></head><body><h1>ZINDAGI — отчёт за ${days} дней</h1><div>${esc((DB.user&&DB.user.name)||'')} · ${new Date().toLocaleDateString('ru-RU')}</div>
+    <p>Доходы: <b>${num(sum(inc))} с.</b> · Расходы: <b>${num(tot)} с.</b> · Итог: <b>${num(sum(inc)-tot)} с.</b></p><h2>Расходы по категориям</h2><table><tr><th>Категория</th><th class="r">Сумма, с.</th><th class="r">Доля</th></tr>${rows.map(r=>`<tr><td>${(CATS[r.k]||CATS.other).n}</td><td class="r">${num(r.v)}</td><td class="r">${Math.round(r.v/tot*100)}%</td></tr>`).join('')}</table>
+    <h2>Операции</h2><table><tr><th>Дата</th><th>Категория</th><th>Описание</th><th class="r">Сумма, с.</th></tr>${ops.map(o=>`<tr><td>${iso(o.ts)}</td><td>${cn(o)}</td><td>${esc(o.note||'')}</td><td class="r">${o.k}${num(o.amount)}</td></tr>`).join('')}</table></body></html>`;
+    const f=document.createElement('iframe');f.style.cssText='position:fixed;right:0;bottom:0;width:0;height:0;border:0';document.body.appendChild(f);f.onload=()=>{try{f.contentWindow.focus();f.contentWindow.print()}catch(e){toast('Не удалось открыть печать',{plain:true})}setTimeout(()=>f.remove(),60000)};f.srcdoc=h},
+  addAccount(){formSheet({title:'Новый счёт',fields:[{id:'name',label:'Название',ph:'Наличные, Карта, Alif, Душанбе Сити',req:1,msg:'Введите название',focus:1}],onSubmit:v=>{DB.accounts=[...(DB.accounts||[]),{id:uid(),name:v.name}];commit();toast('Счёт добавлен',{plain:true})}})},
+  delAccount(t){const a=(DB.accounts||[]).find(x=>x.id===t.dataset.id);if(!a)return;confirmSheet({title:'Удалить счёт?',text:'Операции по счёту «'+a.name+'» перейдут в «Без счёта». Общий баланс не изменится.',ok:'Удалить',danger:true,onOk:()=>{DB.accounts=DB.accounts.filter(x=>x.id!==a.id);commit()}})},
+  transfer(){const O=[{id:'',name:'Без счёта'},...(DB.accounts||[])],ch=(k,sel)=>`<div class="fld"><span>${k==='from'?'Откуда':'Куда'}</span><div class="chips scroll" data-chips="${k}">${O.map((a,i)=>`<button type="button" class="chip" aria-pressed="${i===sel}" data-v="${a.id}">${esc(a.name)}</button>`).join('')}</div></div>`;
+    openSheet(`<h2 class="sh-h">Перевод между счетами</h2>${ch('from',0)}${ch('to',1)}<label class="fld"><span>Сумма, с.</span><input class="inp" id="f_tr" inputmode="decimal" placeholder="500" autocomplete="off"></label><div class="ferr" role="alert" data-err></div><button class="btn pri blk" data-submit>Перевести</button>`,{mount(sh){
+      const run=()=>{const g=k=>$(`[data-chips="${k}"] [aria-pressed="true"]`,sh).dataset.v,a=parseFloat($('#f_tr',sh).value.replace(/\s/g,'').replace(',','.')),f=g('from'),to=g('to'),er=m=>{$('[data-err]',sh).textContent=m};
+        if(f===to)return er('Выберите разные счета');if(!(a>0))return er('Введите сумму больше 0');if(accBal(f)<a)return er('На счёте недостаточно денег');
+        DB.transfers=[...(DB.transfers||[]),{id:uid(),from:f,to,amount:a,ts:Date.now()}];log('money','Перевод между счетами '+money(a),false,'swap');commit();closeSheet();toast('Перевод выполнен',{plain:true})};
+      $('[data-submit]',sh).onclick=run;sh.addEventListener('keydown',e=>{if(e.key==='Enter'&&e.target.tagName==='INPUT')run()})}})},
+  addHabit(){formSheet({title:'Новая привычка',fields:[{id:'name',label:'Название',ph:'Например: пить воду',req:1,msg:'Введите название',focus:1}],onSubmit:v=>{DB.habits=[...(DB.habits||[]),{id:uid(),name:v.name,days:[]}];commit();toast('Привычка добавлена',{plain:true})}})},
+  habitDay(t){const h=(DB.habits||[]).find(x=>x.id===t.dataset.id);if(!h)return;const d=iso(Date.now());h.days=(h.days||[]).includes(d)?h.days.filter(x=>x!==d):[...(h.days||[]),d].slice(-400);const n=habitStreak(h);commit();if(n&&n%7===0)tgNotify(`🔥 «${h.name}»: серия ${n} дн.!`)},
+  delHabit(t){DB.habits=(DB.habits||[]).filter(x=>x.id!==t.dataset.id);commit()},
+  exportReport(){const from=Date.now()-30*DAY,rows=[...(DB.expenses||[]).map(e=>({...e,k:'Расход'})),...(DB.incomes||[]).map(e=>({...e,k:'Доход'}))].filter(e=>e.ts>=from).sort((a,b)=>b.ts-a.ts);
+    const q=v=>'"'+String(v==null?'':v).replace(/"/g,'""')+'"',cn=e=>((e.k==='Доход'?ICATS:CATS)[e.category]||CATS.other).n;
+    const csv='\ufeff'+['Дата;Тип;Категория;Описание;Сумма'].concat(rows.map(e=>[iso(e.ts),e.k,cn(e),e.note,(e.k==='Доход'?'':'-')+e.amount].map(q).join(';'))).join('\r\n');
+    const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8'}));a.download='zindagi-report-'+iso(Date.now())+'.csv';document.body.appendChild(a);a.click();a.remove();toast('Отчёт за 30 дней сохранён',{plain:true})},
+  setBudget(t){const B=DB.budgets||{},pre=t&&t.dataset&&t.dataset.cat&&CATS[t.dataset.cat]?t.dataset.cat:Object.keys(CATS).find(k=>!(B[k]>0))||Object.keys(CATS)[0];
+    catSheet({title:'Бюджет на месяц',cat:pre,label:'Лимит на месяц, с. (0 — убрать бюджет)',ph:'1500',val:B[pre]||'',onSave:({cat,amt})=>{if(amt<0)return'Введите сумму лимита';DB.budgets={...(DB.budgets||{})};if(amt===0)delete DB.budgets[cat];else DB.budgets[cat]=amt;commit();toast(amt?'Бюджет сохранён':'Бюджет убран')}})},
+  tplAdd(){catSheet({title:'Быстрый расход',cat:'food',note:1,label:'Сумма, с.',ph:'25',hint:'Один тап на главной — и расход записан.',onSave:({cat,amt,note})=>{if(!note)return'Введите название';if(!(amt>0))return'Сумма должна быть больше 0';DB.templates=[...(DB.templates||[]),{id:uid(),note,amount:amt,category:cat}];commit();toast('Шаблон добавлен')}})},
+  tplUse(t){const x=(DB.templates||[]).find(q=>q.id===t.dataset.id);if(!x)return;M.addExpense({amount:x.amount,category:x.category,note:x.note});toast('Расход добавлен: '+x.note+' −'+num(x.amount)+' с.',{plain:true})},
+  tplEdit(){openSheet(`<h2 class="sh-h">Быстрые расходы</h2>${(DB.templates||[]).map(x=>`<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 0"><span>${esc(x.note)} · ${num(x.amount)} с.</span><button class="btn danger sm" data-act="tplDel" data-id="${x.id}">Удалить</button></div>`).join('')||'<p class="sh-p">Шаблонов нет.</p>'}`)},
+  tplDel(t){DB.templates=(DB.templates||[]).filter(x=>x.id!==t.dataset.id);closeSheet();commit();toast('Шаблон удалён',{plain:true})},
   nav(t){navTo(t.dataset.to,t.dataset.p?JSON.parse(t.dataset.p):{})},back,
   tab(t){navTo(t.dataset.to)},
   closeSheet,toastAct(){const cb=UI.toastCb;UI.toastCb=null;$('#toast').classList.remove('show');cb&&cb()},
