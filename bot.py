@@ -228,6 +228,11 @@ class Firebase:
     def get(self, path: str) -> Any:
         return self._db.reference(path).get()
 
+    def keys(self, path: str) -> list[str]:
+        """Только имена дочерних узлов (без загрузки данных)."""
+        res = self._db.reference(path).get(shallow=True)
+        return list(res.keys()) if isinstance(res, dict) else []
+
     def set(self, path: str, value: Any) -> None:
         self._db.reference(path).set(value)
 
@@ -245,6 +250,11 @@ class Firebase:
         from firebase_admin import auth
         t = auth.create_custom_token(str(uid))
         return t.decode() if isinstance(t, bytes) else str(t)
+
+    def revoke(self, uid: int) -> None:
+        """Завершить все входы пользователя в Firebase Auth (после блокировки)."""
+        from firebase_admin import auth
+        auth.revoke_refresh_tokens(str(uid))
 
     def set_premium(self, uid: int, until_ms: int) -> None:
         self._db.reference(f"premium/{uid}").set(
@@ -408,6 +418,12 @@ class AccessStore:
             status TEXT NOT NULL,                               -- new | pending | approved | rejected
             reason TEXT, old_uid INTEGER, created REAL NOT NULL, decided_by INTEGER, decided REAL);
         CREATE TABLE IF NOT EXISTS access_admin_msgs(req_id INTEGER, admin_id INTEGER, message_id INTEGER);
+        CREATE TABLE IF NOT EXISTS support(
+            uid INTEGER PRIMARY KEY, chat_id INTEGER NOT NULL, name TEXT, username TEXT, phone TEXT,
+            state TEXT NOT NULL,                                -- open | closed
+            last_admin REAL NOT NULL DEFAULT 0, last_user REAL NOT NULL DEFAULT 0, closed_sent INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS support_msgs(admin_id INTEGER, message_id INTEGER, uid INTEGER);
+        CREATE TABLE IF NOT EXISTS sec_resp(rid INTEGER PRIMARY KEY, answer TEXT NOT NULL, ts REAL NOT NULL);
         """)
         self.c.commit()
 
@@ -477,6 +493,51 @@ class AccessStore:
     def admin_msgs(self, rid: int) -> list[sqlite3.Row]:
         with self.lock:
             return self.c.execute("SELECT * FROM access_admin_msgs WHERE req_id=?", (rid,)).fetchall()
+
+    # служба поддержки: диалоги «пользователь ↔ админ»
+    def sup(self, uid: int) -> Optional[sqlite3.Row]:
+        with self.lock:
+            return self.c.execute("SELECT * FROM support WHERE uid=?", (uid,)).fetchone()
+
+    def sup_open(self, uid: int, chat_id: int, name: str, username: str, phone: str) -> None:
+        self._run(
+            "INSERT INTO support(uid,chat_id,name,username,phone,state) VALUES(?,?,?,?,?,'open') "
+            "ON CONFLICT(uid) DO UPDATE SET chat_id=excluded.chat_id, name=excluded.name, username=excluded.username, "
+            "phone=CASE WHEN excluded.phone!='' THEN excluded.phone ELSE support.phone END, state='open', closed_sent=0",
+            (uid, chat_id, name, username, phone))
+
+    def sup_touch(self, uid: int, who: str, now: float) -> None:
+        if who == "admin":
+            self._run("UPDATE support SET last_admin=?, state='open', closed_sent=0 WHERE uid=?", (now, uid))
+        else:
+            self._run("UPDATE support SET last_user=? WHERE uid=?", (now, uid))
+
+    def sup_due(self, now: float, wait: float) -> list[sqlite3.Row]:
+        """Админ ответил, а пользователь молчит дольше wait секунд."""
+        with self.lock:
+            return self.c.execute(
+                "SELECT * FROM support WHERE state='open' AND last_admin>0 AND last_user<last_admin "
+                "AND closed_sent=0 AND ?-last_admin>=?", (now, wait)).fetchall()
+
+    def sup_close(self, uid: int) -> None:
+        self._run("UPDATE support SET state='closed', closed_sent=1 WHERE uid=?", (uid,))
+
+    def sup_map_add(self, admin_id: int, message_id: int, uid: int) -> None:
+        self._run("INSERT INTO support_msgs VALUES(?,?,?)", (admin_id, message_id, uid))
+
+    def sup_map_get(self, admin_id: int, message_id: int) -> Optional[int]:
+        with self.lock:
+            r = self.c.execute("SELECT uid FROM support_msgs WHERE admin_id=? AND message_id=?",
+                               (admin_id, message_id)).fetchone()
+        return int(r["uid"]) if r else None
+
+    def sec(self, rid: int) -> Optional[str]:
+        with self.lock:
+            r = self.c.execute("SELECT answer FROM sec_resp WHERE rid=?", (rid,)).fetchone()
+        return r["answer"] if r else None
+
+    def sec_set(self, rid: int, answer: str, now: float) -> None:
+        self._run("INSERT OR REPLACE INTO sec_resp VALUES(?,?,?)", (rid, answer, now))
 
 
 # ───────────────────────────── логика бота ─────────────────────────────
@@ -886,6 +947,8 @@ class LoginBot:
     # --- решение: можно ли выдать код ---
     def decide(self, mode: str, phone: str, uid: int, frm: dict) -> tuple[str, str, bool]:
         """→ (status, hint, returning). status: ok | phone_taken | tg_has_other | not_found."""
+        if self.fb.get(f"blocked/phone/{phone}") is not None or self.fb.get(f"blocked/uid/{uid}") is not None:
+            return "blocked", "", False
         owner, _ = self.owner_of(phone)
         mine = self.fb.get(f"tgusers/{uid}") or {}
         my_phone = canon_phone(mine.get("phone"))
@@ -943,6 +1006,10 @@ class LoginBot:
                 elif self.a:
                     text += "\n\nЕсли у вас больше нет доступа к тому Telegram — нажмите кнопку ниже."
                     markup = kb([[("🚫 Нет доступа к Telegram", f"na:{phone}")]])
+            elif status == "blocked":
+                text = ("🔒 Аккаунт ZINDAGI заблокирован по запросу владельца.\n"
+                        "Чтобы разобраться и вернуть доступ, нажмите кнопку ниже.")
+                markup = kb([[("📞 Связаться со службой поддержки", "sp:go")]])
             elif status == "tg_has_other":
                 text = f"❌ Этот Telegram уже привязан к номеру {hint}. Укажите именно этот номер."
             else:
@@ -1173,7 +1240,8 @@ class LoginBot:
                                   f"Номер вашего аккаунта: {fmt_phone(req['phone'])}", markup)
         if old_uid and old_uid != req["user_id"]:
             self.send(old_uid, f"⚠️ Аккаунт ZINDAGI {mask_phone(req['phone'])} перенесён на другой Telegram по заявке "
-                               f"в службу поддержки. Если это были не вы — срочно обратитесь в поддержку.")
+                               f"в службу поддержки. Если это были не вы — срочно обратитесь в поддержку.",
+                      kb([[("✅ Это я", f"me:{rid}"), ("🚫 Это не я", f"ne:{rid}")]]))
         who = html.escape(admin.get("first_name") or admin.get("username") or str(admin["id"]))
         self._mark_cards(rid, f"\n\n✅ <b>Подключено</b> · {who} · {fmt_dt(now)}")
 
@@ -1217,6 +1285,15 @@ class LoginBot:
             return self.start_access_flow(cq, mt.group(1))
         if data == "nac":
             return self.cancel_access_flow(cq)
+        if data == "sp:go":
+            self.answer(cq["id"])
+            return self.start_support((cq.get("message") or {}).get("chat", {}).get("id", frm["id"]), frm)
+        if (mt := re.fullmatch(r"(me|ne):(\d+)", data)) and self.a:
+            return self.security_answer(cq, mt.group(1) == "me", int(mt.group(2)))
+        if (mt := re.fullmatch(r"(ub|rv):(\d+)", data)) and self.a:
+            if frm["id"] not in self.cfg.admins:
+                return self.answer(cq["id"], "Нет доступа", True)
+            return self.block_admin_action(cq, mt.group(1), int(mt.group(2)))
         mt = re.fullmatch(r"(ap|rj|rb|rr):(\d+)(?::(\d+))?", data)
         if not mt or not self.a:
             return self.answer(cq["id"])
@@ -1231,6 +1308,176 @@ class LoginBot:
             self.back_from_reason(rid, cq)
         else:
             self.reject_access(rid, int(mt.group(3) or -1), frm, cq["id"])
+
+    # ───────────── «Это я / Это не я»: защита от угона аккаунта ─────────────
+    def block_account(self, req: sqlite3.Row) -> None:
+        now_ms = int(self.now() * 1000)
+        info = {"rid": req["id"], "by": req["old_uid"], "ts": now_ms}
+        self.fb.set(f"blocked/phone/{req['phone']}", {**info, "uid": req["user_id"]})
+        self.fb.set(f"blocked/uid/{req['user_id']}", {**info, "phone": req["phone"]})
+        try:
+            self.fb.revoke(req["user_id"])
+        except Exception:
+            log.exception("Не удалось завершить сессии Firebase пользователя %s", req["user_id"])
+
+    def unblock_account(self, req: sqlite3.Row) -> None:
+        self.fb.delete(f"blocked/phone/{req['phone']}")
+        self.fb.delete(f"blocked/uid/{req['user_id']}")
+
+    def security_answer(self, cq: dict, yes: bool, rid: int) -> None:
+        frm, req = cq["from"], self.a.req(rid)
+        if not req or not req["old_uid"] or frm["id"] != int(req["old_uid"]):
+            return self.answer(cq["id"], "Недоступно", True)
+        if self.a.sec(rid):
+            return self.answer(cq["id"], "Вы уже ответили", True)
+        self.a.sec_set(rid, "yes" if yes else "no", self.now())
+        msg = cq.get("message") or {}
+        chat = msg.get("chat", {}).get("id", frm["id"])
+        self.answer(cq["id"])
+        self.tg.call("editMessageReplyMarkup", chat_id=chat, message_id=msg.get("message_id"))  # убрать кнопки
+        if yes:
+            return self.send(chat, "✅ Спасибо, подтвердили. Если понадобится помощь — команда /support.")
+        try:
+            self.block_account(req)
+        except Exception:
+            log.exception("Блокировка по заявке #%s", rid)
+            return self.send(chat, "⚠️ Не удалось заблокировать автоматически. Мы уже передали сигнал в службу поддержки.")
+        full = " ".join(x for x in (frm.get("first_name"), frm.get("last_name")) if x)
+        self.a.sup_open(frm["id"], chat, full, frm.get("username") or "", req["phone"])
+        self.send(chat, "🔒 Не переживайте! Вашего аккаунта я заблокировал и отправил запрос в службу поддержки.\n"
+                        "В ближайшее время мы свяжемся с вами и поможем вернуть доступ.\n\n"
+                        "Можете сразу написать сюда подробности — сообщения получит служба поддержки.")
+        old_n = f"@{frm['username']}" if frm.get("username") else "без username"
+        new_n = f"@{req['username']}" if req["username"] else "без username"
+        text = (f"🚨 <b>«Это не я»</b> · заявка #{rid}\n"
+                f"📞 Номер: <b>{fmt_phone(req['phone'])}</b>\n"
+                f"👤 Пожаловался (прежний владелец): {html.escape(full or '—')} · {old_n} · ID <code>{frm['id']}</code> · "
+                f"<a href=\"tg://user?id={frm['id']}\">чат</a>\n"
+                f"✈️ Новый Telegram: {html.escape(req['tg_name'] or '—')} · {new_n} · ID <code>{req['user_id']}</code> · "
+                f"<a href=\"tg://user?id={req['user_id']}\">чат</a>\n"
+                f"🔒 Аккаунт заблокирован: вход и облако закрыты.\n\n"
+                f"↩️ Ответьте <b>реплаем</b> на это сообщение — ответ уйдёт прежнему владельцу, и диалог начнётся.")
+        mk = kb([[("🔓 Разблокировать", f"ub:{rid}"), ("↩️ Вернуть владельцу", f"rv:{rid}")]])
+        for admin in self.cfg.admins:
+            r = self.tg.call("sendMessage", chat_id=admin, text=text, parse_mode="HTML",
+                             disable_web_page_preview=True, reply_markup=mk)
+            if r:
+                self.a.sup_map_add(admin, r["message_id"], frm["id"])
+
+    def revert_phone(self, req: sqlite3.Row) -> None:
+        """Вернуть номер, профиль, данные и подписку прежнему владельцу."""
+        old_uid, new_uid, phone = int(req["old_uid"]), int(req["user_id"]), req["phone"]
+        now_ms = int(self.now() * 1000)
+        cur = self.fb.get(f"tgusers/{new_uid}") or {}
+        until = max(int((self.fb.get(f"premium/{new_uid}") or {}).get("until") or 0),
+                    self.store.premium_until(new_uid) if self.store else 0)
+        self.fb.set(f"phones/{phone}", old_uid)
+        self.fb.set(f"tgusers/{old_uid}", {"phone": phone, "name": cur.get("name") or "", "username": "",
+                                           "chat": old_uid, "ts": now_ms})
+        self.fb.delete(f"tgusers/{new_uid}")
+        saved = self.fb.get(f"users/{new_uid}")
+        if saved and self.fb.get(f"users/{old_uid}") is None:
+            self.fb.set(f"users/{old_uid}", saved)
+        self.fb.delete(f"users/{new_uid}")
+        if until > now_ms:
+            self.fb.set_premium(old_uid, until)
+        else:
+            until = 0
+        self.fb.clear_premium(new_uid)
+        if self.store:
+            self.store.move_premium(new_uid, old_uid, until)
+        self.unblock_account(req)
+
+    def block_admin_action(self, cq: dict, kind: str, rid: int) -> None:
+        req = self.a.req(rid)
+        if not req or not req["old_uid"]:
+            return self.answer(cq["id"], "Заявка не найдена", True)
+        msg = cq.get("message") or {}
+        try:
+            if kind == "ub":
+                self.unblock_account(req)
+                note, done = "🔓 Разблокировано", "🔓 <b>Разблокировано</b>"
+            else:
+                self.revert_phone(req)
+                note, done = "↩️ Возвращено владельцу", "↩️ <b>Номер возвращён прежнему владельцу</b>"
+                markup = kb([[("📱 Открыть приложение", "url:" + self.cfg.app_url)]]) if self.cfg.app_url.startswith("http") else None
+                self.send(int(req["old_uid"]), "✅ Доступ к вашему аккаунту ZINDAGI возвращён. Заходите в приложение — все данные на месте.", markup)
+                self.send(int(req["user_id"]), "ℹ️ Аккаунт ZINDAGI возвращён прежнему владельцу по решению службы поддержки.")
+        except Exception:
+            log.exception("Действие %s по заявке #%s", kind, rid)
+            return self.answer(cq["id"], "❌ Не удалось выполнить. Проверьте Firebase и повторите.", True)
+        self.answer(cq["id"], note)
+        who = html.escape(cq["from"].get("first_name") or str(cq["from"]["id"]))
+        self.tg.call("editMessageText", chat_id=msg.get("chat", {}).get("id", cq["from"]["id"]), message_id=msg.get("message_id"),
+                     text=(msg.get("text") or "") + f"\n\n{re.sub('<[^>]+>', '', done)} · {who}", disable_web_page_preview=True)
+
+    # ───────────── Служба поддержки ─────────────
+    SUPPORT_WAIT = 600  # 10 минут тишины после ответа админа → «разговор завершён»
+
+    def start_support(self, chat: int, frm: dict) -> None:
+        uid = frm["id"]
+        if not self.a:
+            return
+        u = self.fb.get(f"tgusers/{uid}") or {}
+        full = " ".join(x for x in (frm.get("first_name"), frm.get("last_name")) if x)
+        self.a.sup_open(uid, chat, full, frm.get("username") or "", canon_phone(u.get("phone")) or "")
+        self.send(chat, "💬 Вы на связи со службой поддержки.\n"
+                        "Напишите сообщение (можно приложить фото) — мы передадим его специалисту, ответ придёт сюда.\n"
+                        "Завершить диалог: /cancel")
+
+    def _sup_head(self, s: sqlite3.Row) -> str:
+        who = f"@{s['username']}" if s["username"] else "без username"
+        return (f"💬 <b>Служба поддержки</b>\n👤 {html.escape(s['name'] or '—')} · {who} · ID <code>{s['uid']}</code>"
+                + (f"\n📞 {fmt_phone(s['phone'])}" if s["phone"] else "") + "\n↩️ Ответьте реплаем на это сообщение.")
+
+    def user_to_support(self, m: dict) -> None:
+        uid, chat = m["from"]["id"], m["chat"]["id"]
+        s = self.a.sup(uid)
+        if not s or s["state"] != "open":
+            return self.send(chat, "Чтобы написать в службу поддержки, нажмите кнопку ниже.",
+                             kb([[("📞 Связаться", "sp:go")]]))
+        head, text, delivered = self._sup_head(s), m.get("text"), 0
+        for admin in self.cfg.admins:
+            if text:
+                sent = [self.tg.call("sendMessage", chat_id=admin, parse_mode="HTML",
+                                     text=head + "\n\n" + html.escape(text[:3500]))]
+            else:
+                sent = [self.tg.call("sendMessage", chat_id=admin, parse_mode="HTML", text=head),
+                        self.tg.call("copyMessage", chat_id=admin, from_chat_id=chat, message_id=m["message_id"])]
+            for r in sent:
+                if r:
+                    self.a.sup_map_add(admin, r["message_id"], uid)
+                    delivered += 1
+        if not delivered:
+            return self.send(chat, "⚠️ Не удалось передать сообщение. Попробуйте чуть позже.")
+        self.a.sup_touch(uid, "user", self.now())
+
+    def admin_to_user(self, m: dict, uid: int) -> None:
+        s = self.a.sup(uid)
+        if not s:
+            return self.send(m["chat"]["id"], "Диалог с этим пользователем не найден.")
+        chat = s["chat_id"]
+        if m.get("text"):
+            ok = self.send(chat, "💬 <b>Служба поддержки:</b>\n" + html.escape(m["text"]), html_mode=True)
+        else:
+            self.send(chat, "💬 Служба поддержки отправила вам файл:")
+            ok = self.tg.call("copyMessage", chat_id=chat, from_chat_id=m["chat"]["id"], message_id=m["message_id"])
+        if not ok:
+            return self.send(m["chat"]["id"], "⚠️ Не доставлено: пользователь закрыл бота или заблокировал его.")
+        self.a.sup_touch(uid, "admin", self.now())
+        self.tg.call("sendMessage", chat_id=m["chat"]["id"], reply_to_message_id=m["message_id"],
+                     text="✅ Доставлено. Если пользователь не ответит 10 минут — диалог закроется сам.")
+
+    def support_loop(self) -> None:
+        while True:
+            try:
+                for s in self.a.sup_due(self.now(), self.SUPPORT_WAIT):
+                    self.a.sup_close(s["uid"])
+                    self.send(s["chat_id"], "✅ Разговор завершён.\nДля обратной связи со службой поддержки нажмите кнопку ниже.",
+                              kb([[("📞 Связаться", "sp:go")]]))
+            except Exception:
+                log.exception("support_loop")
+            time.sleep(15)
 
     # --- уведомления из приложения ---
     def drain_outbox(self) -> None:
@@ -1290,20 +1537,233 @@ class LoginBot:
         if text.startswith("/start"):
             self.on_start(m, text.partition(" ")[2].strip())
             return
-        flow = self.a.flow(m["from"]["id"]) if self.a else None
-        if text.split("@")[0].lower() == "/cancel" and flow:
-            self.a.flow_del(m["from"]["id"])
-            self.send(m["chat"]["id"], "Заявка отменена.")
-        elif text.startswith("/"):
-            self.send(m["chat"]["id"], "Откройте приложение ZINDAGI — код входа придёт сюда.")
+        uid = m["from"]["id"]
+        flow = self.a.flow(uid) if self.a else None
+        cmd = text.split()[0].split("@")[0].lower() if text.startswith("/") else ""
+        if cmd == "/support" and self.a:
+            if flow:
+                self.a.flow_del(uid)
+            self.start_support(m["chat"]["id"], m["from"])
+        elif cmd == "/cancel":
+            if flow:
+                self.a.flow_del(uid)
+                self.send(m["chat"]["id"], "Заявка отменена.")
+            elif self.a and (s := self.a.sup(uid)) and s["state"] == "open":
+                self.a.sup_close(uid)
+                self.send(m["chat"]["id"], "Диалог со службой поддержки завершён. Чтобы написать снова — /support.")
+        elif cmd:
+            self.send(m["chat"]["id"], "Откройте приложение ZINDAGI — код входа придёт сюда.\n"
+                                       "Связаться со службой поддержки: /support")
         elif flow:
             self.on_flow_message(m, flow)
+        elif self.a and uid in self.cfg.admins:
+            rt = m.get("reply_to_message")
+            target = self.a.sup_map_get(uid, rt["message_id"]) if rt else None
+            if target:
+                self.admin_to_user(m, target)
+            else:
+                self.send(m["chat"]["id"], "Чтобы ответить пользователю, ответьте реплаем на его сообщение.")
+        elif self.a:
+            self.user_to_support(m)
+
+    # --- недельный отчёт: понедельник, 09:00 (Таджикистан) ---
+    CAT_NAMES = {"food": "Еда", "transport": "Транспорт", "shopping": "Покупки", "home": "Дом",
+                 "communication": "Связь", "technology": "Техника", "education": "Учёба",
+                 "health": "Здоровье", "entertainment": "Досуг", "other": "Другое"}
+
+    def read_section(self, uid: str, key: str) -> Any:
+        """Раздел приложения из облака: users/<uid>/d/<key>/c/<n> — JSON, разрезанный на куски."""
+        node = self.fb.get(f"users/{uid}/d/{key}")
+        if not isinstance(node, dict):
+            return None
+        c = node.get("c")
+        n = int(node.get("n") or 0)
+        if isinstance(c, list):
+            parts = c
+        elif isinstance(c, dict):
+            parts = [c.get(str(i)) for i in range(n)]
+        else:
+            return None
+        if not parts or any(not isinstance(x, str) for x in parts):
+            return None
+        return json.loads("".join(parts))
+
+    def week_report_text(self, uid: str) -> Optional[str]:
+        if self.read_section(uid, "notif") is False:
+            return None                              # человек отключил уведомления
+        exp = self.read_section(uid, "expenses") or []
+        inc = self.read_section(uid, "incomes") or []
+        now = int(time.time() * 1000)
+        w0, w1 = now - 7 * DAY_MS, now - 14 * DAY_MS
+        cur = [e for e in exp if isinstance(e, dict) and int(e.get("ts") or 0) >= w0]
+        prev = [e for e in exp if isinstance(e, dict) and w1 <= int(e.get("ts") or 0) < w0]
+        if not cur and not prev:
+            return None
+        amt = lambda L: sum(float(e.get("amount") or 0) for e in L)
+        tot, ptot = amt(cur), amt(prev)
+        earned = amt([e for e in inc if isinstance(e, dict) and int(e.get("ts") or 0) >= w0])
+        money = lambda v: f"{int(round(v)):,}".replace(",", " ") + " с."
+        lines = ["📊 Итоги недели", f"Потрачено: {money(tot)}"]
+        if ptot > 0:
+            d = round((tot - ptot) / ptot * 100)
+            lines.append(("📈 на " if d > 0 else "📉 на ") + f"{abs(d)}% {'больше' if d > 0 else 'меньше'}, чем на прошлой неделе ({money(ptot)})"
+                         if d else f"Столько же, сколько на прошлой неделе ({money(ptot)})")
+        if earned:
+            lines.append(f"Доходы: +{money(earned)}")
+        by: dict[str, float] = {}
+        for e in cur:
+            k = str(e.get("category") or "other")
+            by[k] = by.get(k, 0) + float(e.get("amount") or 0)
+        top = sorted(by.items(), key=lambda x: -x[1])[:3]
+        if top:
+            lines.append("\nБольше всего ушло на:")
+            lines += [f"{i}. {self.CAT_NAMES.get(k, 'Другое')} — {money(v)}" for i, (k, v) in enumerate(top, 1)]
+        # бюджеты по категориям: предупредим, если за месяц уже 80%+
+        budgets = self.read_section(uid, "budgets") or {}
+        if isinstance(budgets, dict) and budgets:
+            ms = datetime.now(TZ).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            m0 = int(ms.timestamp() * 1000)
+            spent: dict[str, float] = {}
+            for e in exp:
+                if isinstance(e, dict) and int(e.get("ts") or 0) >= m0:
+                    k = str(e.get("category") or "other")
+                    spent[k] = spent.get(k, 0) + float(e.get("amount") or 0)
+            warn = [f"⚠️ {self.CAT_NAMES.get(k, k)}: {round(spent.get(k, 0) / lim * 100)}% бюджета"
+                    for k, lim in budgets.items() if isinstance(lim, (int, float)) and lim > 0 and spent.get(k, 0) >= lim * 0.8]
+            if warn:
+                lines.append("\nБюджеты месяца:")
+                lines += warn
+        return "\n".join(lines)
+
+    def weekly_reports(self) -> None:
+        now = datetime.now(TZ)
+        if now.weekday() != 0 or now.hour < 9:
+            return
+        week = now.strftime("%G-W%V")
+        for uid in self.fb.keys("tgusers"):
+            if not uid.isdigit() or self.fb.get(f"reports/{uid}/last") == week:
+                continue
+            try:
+                if self.fb.get(f"blocked/uid/{uid}") is not None:
+                    continue
+                text = self.week_report_text(uid)
+                self.fb.set(f"reports/{uid}/last", week)   # отметка ставится всегда: раз в неделю
+                if text:
+                    self.send(int(uid), text)
+                    time.sleep(0.1)
+            except Exception:
+                log.exception("недельный отчёт %s", uid)
+
+    def report_loop(self) -> None:
+        while True:
+            try:
+                self.weekly_reports()
+            except Exception:
+                log.exception("report_loop")
+            time.sleep(600)
+
+    # --- AI через OpenRouter: приложение кладёт запрос в aireq/<uid>/<id>, ответ — в airesp/<uid>/<id> ---
+    AI_SYSTEM = ("Ты — ZINDAGI AI, личный финансовый помощник в приложении. Валюта по умолчанию — сомони (с.). "
+                 "Отвечай на языке пользователя (по умолчанию по-русски), дружелюбно и коротко: не больше 6 предложений. "
+                 "Опирайся только на данные из блока «Данные пользователя», ничего не выдумывай: если данных не хватает — скажи об этом. "
+                 "Давай конкретные расчёты и практичные советы. Ты не юрист и не финансовый консультант; не обещай доходность.")
+    RECEIPT_PROMPT = ("На фото кассовый чек. Верни ТОЛЬКО JSON без пояснений: "
+                      '{"amount": итоговая сумма числом, "currency": "TJS|RUB|USD|UZS", '
+                      '"category": одно из food|transport|shopping|home|communication|technology|education|health|entertainment|other, '
+                      '"note": краткое описание покупки до 40 символов}. Если это не чек или сумму не видно — {"amount": 0}.')
+
+    def llm(self, messages: list, model: str, max_tokens: int = 500, temperature: float = 0.4) -> str:
+        key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+        if not key:
+            raise RuntimeError("no_key")
+        r = requests.post("https://openrouter.ai/api/v1/chat/completions", timeout=60,
+                          headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json",
+                                   "HTTP-Referer": self.cfg.app_url or "https://zindagi.app", "X-Title": "ZINDAGI"},
+                          json={"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature})
+        r.raise_for_status()
+        return str(r.json()["choices"][0]["message"]["content"] or "").strip()
+
+    def ai_handle(self, uid: str, rid: str, req: dict) -> None:
+        out: dict[str, Any] = {"ok": False, "err": "error"}
+        try:
+            now = time.time()
+            prem = self.fb.get(f"premium/{uid}")
+            if not (isinstance(prem, dict) and int(prem.get("until") or 0) > now * 1000):
+                out = {"ok": False, "err": "Нужна активная подписка."}
+            elif self.fb.get(f"blocked/uid/{uid}") is not None:
+                out = {"ok": False, "err": "Доступ закрыт."}
+            else:
+                hist = [t for t in self._ai_hist.get(uid, []) if now - t < 3600]
+                if len(hist) >= 40:
+                    out = {"ok": False, "err": "Слишком много запросов, попробуйте через час."}
+                else:
+                    hist.append(now)
+                    self._ai_hist[uid] = hist
+                    model = os.environ.get("OPENROUTER_MODEL", "openai/gpt-4o-mini")
+                    kind = req.get("kind")
+                    if kind == "chat":
+                        msgs = [{"role": "system", "content": self.AI_SYSTEM}]
+                        for m in (req.get("hist") or [])[-8:]:
+                            if isinstance(m, dict) and m.get("role") in ("user", "assistant"):
+                                msgs.append({"role": m["role"], "content": str(m.get("content", ""))[:400]})
+                        msgs.append({"role": "user", "content":
+                                     f"Данные пользователя: {str(req.get('ctx', ''))[:1800]}\n\nВопрос: {str(req.get('q', ''))[:500]}"})
+                        out = {"ok": True, "text": self.llm(msgs, model)[:1500]}
+                    elif kind == "receipt":
+                        img = str(req.get("img", ""))
+                        if not img.startswith("data:image/"):
+                            raise ValueError("bad_image")
+                        raw = self.llm([{"role": "user", "content": [
+                            {"type": "text", "text": self.RECEIPT_PROMPT},
+                            {"type": "image_url", "image_url": {"url": img}}]}],
+                            os.environ.get("OPENROUTER_VISION_MODEL", model), max_tokens=200, temperature=0)
+                        m = re.search(r"\{.*\}", raw, re.S)
+                        d = json.loads(m.group(0)) if m else {}
+                        amount = float(d.get("amount") or 0)
+                        cat = d.get("category") if d.get("category") in self.CAT_NAMES else "other"
+                        cur = d.get("currency") if d.get("currency") in ("TJS", "RUB", "USD", "UZS") else "TJS"
+                        out = ({"ok": True, "amount": round(amount, 2), "category": cat, "currency": cur,
+                                "note": str(d.get("note") or "")[:40]} if amount > 0
+                               else {"ok": False, "err": "Не удалось прочитать чек. Сфотографируйте ближе и при хорошем свете."})
+        except RuntimeError as e:
+            out = {"ok": False, "err": "AI ещё не настроен администратором." if str(e) == "no_key" else "Ошибка AI."}
+        except Exception:
+            log.exception("ai_handle")
+            out = {"ok": False, "err": "AI сейчас недоступен. Попробуйте позже."}
+        try:
+            self.fb.set(f"airesp/{uid}/{rid}", out)
+        except Exception:
+            log.exception("airesp")
+
+    def ai_loop(self) -> None:
+        while True:
+            try:
+                for uid in self.fb.keys("aireq"):
+                    reqs = self.fb.get(f"aireq/{uid}")
+                    if isinstance(reqs, dict):
+                        for rid, r in reqs.items():
+                            self.fb.delete(f"aireq/{uid}/{rid}")
+                            if uid.isdigit() and isinstance(r, dict) and int(r.get("ts") or 0) > (time.time() - 120) * 1000:
+                                threading.Thread(target=self.ai_handle, args=(uid, rid, r), daemon=True).start()
+                    else:
+                        self.fb.delete(f"aireq/{uid}")
+            except Exception:
+                log.exception("ai_loop")
+            time.sleep(1.5)
 
     def run(self) -> None:
         me = self.tg.call("getMe")
         self.tg.call("deleteWebhook", drop_pending_updates=False)
         log.info("Бот входа запущен: @%s", (me or {}).get("username", "?"))
         threading.Thread(target=self.outbox_loop, daemon=True).start()
+        threading.Thread(target=self.report_loop, daemon=True).start()
+        self._ai_hist: dict[str, list[float]] = {}
+        threading.Thread(target=self.ai_loop, daemon=True).start()
+        if self.a:
+            threading.Thread(target=self.support_loop, daemon=True).start()
+            self.tg.call("setMyCommands", commands=[
+                {"command": "support", "description": "Связаться со службой поддержки"},
+                {"command": "cancel", "description": "Отменить заявку или закрыть диалог"}])
         offset: Optional[int] = None
         while True:
             try:
