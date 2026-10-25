@@ -2410,7 +2410,7 @@ function pwaBanner(show){
   if(!show){if(b){b.classList.remove('on');setTimeout(()=>b.remove(),400)}return}
   if(b)return;
   b=document.createElement('div');b.id='pwa';b.className='pwa';b.setAttribute('role','region');b.setAttribute('aria-label','Установка приложения');
-  b.innerHTML=`<img src="${MARK}" alt=""><div class="pt"><b>Установить ZINDAGI</b><span>Как обычное приложение</span></div><button class="pgo" type="button">Установить</button><button class="px" type="button" aria-label="Закрыть">×</button>`;
+  b.innerHTML=`<img src="${MARK}" alt=""><div class="pt"><b>Установить ZINDAGI</b><span>${PWA.android()?'Приложение для Android':'Как обычное приложение'}</span></div><button class="pgo" type="button">${PWA.android()?'Скачать':'Установить'}</button><button class="px" type="button" aria-label="Закрыть">×</button>`;
   $('#device').appendChild(b);void b.offsetHeight;b.classList.add('on');
   $('.pgo',b).onclick=pwaInstall;
   $('.px',b).onclick=()=>{try{localStorage.setItem('zindagi.pwa.hide',String(Date.now()+3*DAY))}catch(e){}pwaBanner(false)};
@@ -2424,8 +2424,15 @@ function pwaHelp(){
   else{body=`<p class="sh-p">В Chrome или Edge нажмите значок установки в адресной строке либо меню ⋮ → «Установить ZINDAGI».</p>`}
   openSheet(`<h2 class="sh-h">${title}</h2>${body}<button class="btn pri blk" data-act="closeSheet">Понятно</button>`);
 }
+/* Android: кнопка «Установить» скачивает файл Zindagi.apk, лежащий рядом с index.html. iPhone и компьютер — как раньше. */
+function apkDownload(){
+  try{const a=document.createElement('a');a.href='Zindagi.apk';a.download='Zindagi.apk';a.rel='noopener';document.body.appendChild(a);a.click();a.remove()}catch(e){location.href='Zindagi.apk'}
+  pwaBanner(false);
+  openSheet(`<h2 class="sh-h">Приложение скачивается</h2><p class="sh-p">Когда загрузка файла Zindagi.apk закончится:</p><ol class="pwa-steps"><li>Откройте файл из уведомления или из папки «Загрузки».</li><li>Если Android спросит, разрешите установку из этого источника.</li><li>Нажмите «Установить» и откройте ZINDAGI.</li></ol><button class="btn pri blk" data-act="closeSheet">Понятно</button>`);
+}
 async function pwaInstall(){
   if(PWA.standalone()){toast('Приложение уже установлено',{plain:true});return}
+  if(PWA.android()&&!PWA.inApp()&&location.protocol!=='file:'){apkDownload();return}
   const e=PWA.ev;
   if(e){PWA.ev=null;                                     /* системное окно установки Chrome (событие одноразовое) */
     try{e.prompt();const r=await e.userChoice;if(r&&r.outcome==='accepted'){pwaBanner(false);toast('Устанавливаем приложение…')}}catch(err){pwaHelp()}
