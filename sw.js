@@ -1,5 +1,5 @@
 /* ZINDAGI service worker: оболочка приложения работает офлайн, запросы к Telegram/Firebase не трогаем */
-const VER = 'zindagi-v10';
+const VER = 'zindagi-v11';
 const SHELL = ['./', 'index.html', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png', 'maskable-512.png', 'apple-touch-icon.png'];
 
 self.addEventListener('install', e => {
@@ -23,7 +23,8 @@ self.addEventListener('fetch', e => {
   const req = e.request;
   if (req.method !== 'GET') return;
   const url = new URL(req.url);
-  if (url.origin !== location.origin) return;   // Firebase, Telegram и т. п. — всегда напрямую
+  if (url.origin !== location.origin) return;
+  if (url.pathname.endsWith('.apk')) return;      // APK скачивается напрямую, в кэш не кладём   // Firebase, Telegram и т. п. — всегда напрямую
 
   if (req.mode === 'navigate') {                // страница: сначала сеть (свежая версия), офлайн — из кэша
     e.respondWith(
