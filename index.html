@@ -1332,9 +1332,10 @@ async function syUnwrap(ct,token,code){
   const b=s=>Uint8Array.from(atob(s),c=>c.charCodeAt(0));
   const key=await crypto.subtle.importKey('raw',await crypto.subtle.digest('SHA-256',new TextEncoder().encode('zk'+token+code)),'AES-GCM',false,['decrypt']);
   return new TextDecoder().decode(await crypto.subtle.decrypt({name:'AES-GCM',iv:b(ct.iv)},key,b(ct.d)))}
+const withTO=(p,ms)=>Promise.race([p,new Promise((_,r)=>setTimeout(()=>r(new Error('timeout')),ms))]);
 async function syLogin(code){
   if(!FB||!REG.ct)return false;
-  try{const tok=await syUnwrap(REG.ct,REG.sessionId,code);await FB.auth.signInWithCustomToken(tok);return true}
+  try{const tok=await syUnwrap(REG.ct,REG.sessionId,code);await withTO(FB.auth.signInWithCustomToken(tok),12000);return true}
   catch(e){console.warn('cloud login failed',e);return false}}
 
 /* --- чтение из облака --- */
@@ -1681,7 +1682,7 @@ function authTg(A){
     REG.used=true;REG.otpHash=null;REG.code=null;REG.fromCloud=false;
     const cloudUp=REG.viaBot?await syLogin(v):false;   /* вход в Firebase: токен расшифровывается этим же кодом */
     if(REG.login||REG.returning){let acc=accLoad(REG.tgId)||accAdoptByPhone(REG.phone,REG.cc,REG.tgId,REG.chatId,REG.tgUser);
-      if(!acc&&cloudUp){try{const st=await syFetchAll(String(REG.tgId));if(st){acc=st;acc.user=Object.assign({},st.user,{telegramUserId:String(REG.tgId),tgChat:REG.chatId,tgUsername:REG.tgUser});REG.fromCloud=true}}catch(e){console.warn('cloud restore failed',e)}}
+      if(!acc&&cloudUp){try{const st=await withTO(syFetchAll(String(REG.tgId)),15000);if(st){acc=st;acc.user=Object.assign({},st.user,{telegramUserId:String(REG.tgId),tgChat:REG.chatId,tgUsername:REG.tgUser});REG.fromCloud=true}}catch(e){console.warn('cloud restore failed',e)}}
       if(!acc){const _d=DB;DB={theme:_d.theme||'system',user:{id:'u_'+uid()+uid(),name:REG.name||REG.tgName||'',phone:REG.phone,cc:REG.cc,telegramUserId:String(REG.tgId),tgChat:REG.chatId,tgUsername:REG.tgUser,telegramVerified:true,phoneVerified:false,language:'ru',currency:'TJS',plan:'free',createdAt:Date.now(),updatedAt:Date.now()}};blankData();acc=DB;DB=_d}
       const th=DB.theme||'system';DB=acc;DB.theme=th;Object.assign(DB.user,{tgChat:REG.chatId,tgUsername:REG.tgUser});REG.returning=true;
       tgSend(REG.fromCloud?'🔑 Выполнен вход в ZINDAGI на новом устройстве. Ваши данные загружены из облака.':'🔑 Выполнен вход в ZINDAGI.',REG.chatId);finish();return}
