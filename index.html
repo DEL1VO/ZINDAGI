@@ -1266,7 +1266,7 @@ const rtdb=async(path,method,body,ms)=>{const ac=ms&&typeof AbortController!=='u
 async function tgSend(text,chat,btn){if(!chat)return false;try{const m={chat:String(chat),text:String(I18N.tr(text)).slice(0,500),ts:Date.now()};if(btn)m.btn={t:String(btn).slice(0,40)};await rtdb('outbox','POST',m);return true}catch(e){return false}}
 const tgAdmin=()=>Promise.resolve(false);
 /* сессия входа: null — бот ещё не получил Start; undefined — нет сети (повторим); 401/403 — выбрасываем */
-const tgSession=async token=>{try{return await rtdb('sessions/'+token,'GET',undefined,8000)}catch(e){if(e.status===401||e.status===403)throw e;return undefined}};
+const tgSession=async token=>{try{return await rtdb('sessions/'+token,'GET',undefined,8000)}catch(e){if(e.status===401||e.status===403||!e.status)throw e;return undefined}};
 const maskPhone=(p,cc)=>{const c=ccOf(cc),d=String(p||'').replace(/\D/g,'').slice(-c.len);return d.length===c.len?'+'+c.cc+' '+d.slice(0,2)+'****'+d.slice(-3):''};
 
 
@@ -1551,7 +1551,7 @@ function renderAuth(){
   const A=$('#auth'),tb=$('#tabbar');
   if(UI.phase==='app'){A.hidden=true;A.innerHTML='';tb.hidden=false;return}
   A.hidden=false;tb.hidden=true;A.scrollTop=0;A.onkeydown=null;
-  ({welcome:authWelcome,tg:authTg,pin:authPin,bio:authBio,lock:authLock}[UI.phase]||authWelcome)(A)}
+  ({welcome:authWelcome,plogin:authPlogin,tg:authTg,pw:authPw,pin:authPin,bio:authBio,lock:authLock}[UI.phase]||authWelcome)(A)}
 function enterApp({welcome=false}={}){UI.phase='app';UI.route='home';UI.stack=[];UI.enter=true;UI.shownBal=null;UI.chat=[];UI.pending=null;applyTheme();renderAuth();render();
   if(welcome)toast(DB.seeded?`Добро пожаловать, ${first()}! Мы добавили демо-данные`:REG.returning?`С возвращением, ${first()}!`:`Добро пожаловать, ${first()}!`);
   premRefresh();setTimeout(armGreeting,600);if(typeof cloudSync==='function')cloudSync();if(BOT_READY&&DB.user&&DB.user.tgChat&&!DB.user.cloud)dailyChecks()}
@@ -1560,10 +1560,119 @@ function startDemo(){DB={theme:DB.theme||'system'};DB.user={id:'u_demo',name:'А
 function resetAll(){BIO.clear();try{localStorage.removeItem(KEY)}catch(e){}try{if(FB)FB.auth.signOut().catch(()=>{})}catch(e){}const th=DB.theme,lg=DB.lang,cu=DB.currency;DB={theme:th,lang:lg,currency:cu};Object.assign(REG,{name:'',phone:'',sent:false,pin1:null,code:null,otpHash:null});UI.chat=[];UI.pending=null;UI.lockFails=0;setPhase('welcome')}
 
 
-function startLogin(p,cc){Object.assign(REG,{login:true,viaBot:true,name:'',phone:p,cc:ccOf(cc).cc,sessionId:'',token:'',live:false,sent:false,code:null,otpHash:null,attempts:0,used:false,pin1:null,returning:false,startToken:newStartToken(),chatId:null,tgId:null,tgName:'',tgUser:''});
-  REG.link='https://t.me/'+BOT_USERNAME+'?start=l'+fullPhone(REG.cc,p)+REG.startToken;
+function startLogin(p,cc,reset){if(!netGate())return;Object.assign(REG,{login:true,reset:!!reset,needPw:true,viaBot:true,name:'',phone:p,cc:ccOf(cc).cc,sessionId:'',token:'',live:false,sent:false,code:null,otpHash:null,attempts:0,used:false,pin1:null,returning:false,startToken:newStartToken(),chatId:null,tgId:null,tgName:'',tgUser:''});
+  REG.link='https://t.me/'+BOT_USERNAME+'?start='+(reset?'p':'l')+fullPhone(REG.cc,p)+REG.startToken;
   openTgLink(REG.link);   /* сразу открываем Telegram */
   setPhase('tg')}
+/* ============ Связь с сервером (VPN) · вход по паролю · сброс пароля ============ */
+const NET={ok:null};
+async function fbReach(ms){ms=ms||6000;const ac=typeof AbortController!=='undefined'?new AbortController():null,tm=ac?setTimeout(()=>ac.abort(),ms):0;
+  try{await fetch(FIREBASE_CONFIG.databaseURL+'/premium/0.json',{cache:'no-store',signal:ac?ac.signal:undefined});return true}catch(e){return false}finally{if(tm)clearTimeout(tm)}}
+const netCheck=async()=>{NET.ok=await fbReach();return NET.ok};
+function vpnClose(){const d=document.getElementById('vpnbox');if(d)d.remove()}
+function vpnDialog(){if(document.getElementById('vpnbox'))return;
+  const d=document.createElement('div');d.id='vpnbox';d.setAttribute('role','alertdialog');d.setAttribute('aria-modal','true');
+  d.style.cssText='position:fixed;inset:0;z-index:9999;background:rgba(8,12,18,.6);display:flex;align-items:center;justify-content:center;padding:24px';
+  d.innerHTML=`<div style="background:var(--surface,#fff);color:var(--text,#111);max-width:380px;width:100%;border-radius:24px;padding:26px 22px 18px;box-shadow:0 24px 70px rgba(0,0,0,.35)">
+    <h2 style="margin:0 0 10px;font-size:22px">Нет связи с сервером</h2>
+    <p id="vpn_p" style="margin:0 0 18px;line-height:1.45;color:var(--muted,#6b7280)">Возможно, у вас включён VPN или прокси, и он блокирует доступ к серверу ZINDAGI. Отключите VPN и нажмите «Повторить».</p>
+    <button class="btn pri blk" id="vpn_re">Повторить</button>
+    <div class="center" style="margin-top:6px"><button class="link" id="vpn_x">Закрыть</button></div></div>`;
+  document.body.appendChild(d);
+  const re=d.querySelector('#vpn_re');
+  re.onclick=async()=>{re.disabled=true;re.textContent='Проверяем…';const ok=await netCheck();re.disabled=false;re.textContent='Повторить';if(ok)vpnClose();else d.querySelector('#vpn_p').style.color='var(--danger-ink,#c0392b)'};
+  d.querySelector('#vpn_x').onclick=vpnClose}
+function netWatch(){netCheck().then(ok=>{if(!ok&&UI.phase!=='app')vpnDialog()})}
+const netGate=()=>{if(NET.ok===false){vpnDialog();netCheck().then(ok=>{if(ok)vpnClose()});return false}return true};
+
+/* Пароль на сервер не уходит: из него выводится ключ (PBKDF2), бот хранит только SHA-256 от ключа */
+async function pwKey(pw,phone){const enc=new TextEncoder();
+  const km=await crypto.subtle.importKey('raw',enc.encode(String(pw).normalize('NFKC')),'PBKDF2',false,['deriveBits']);
+  const bits=await crypto.subtle.deriveBits({name:'PBKDF2',hash:'SHA-256',salt:enc.encode('zindagi:'+phone),iterations:150000},km,256);
+  return [...new Uint8Array(bits)].map(x=>x.toString(16).padStart(2,'0')).join('')}
+async function waitSession(tok,tries){for(let i=0;i<(tries||25);i++){const m=await tgSession(tok);if(m&&m.status)return m;await new Promise(r=>setTimeout(r,1000))}return null}
+function authDone(){DB.user.cloud=!!REG.live||!!(FB&&FB.auth.currentUser);DB.salt=uid()+uid();delete DB.pinHash;DB.bio=false;
+  const np=!!REG.needPw&&!!(REG.viaBot||REG.live);if(np)DB.user.pwPending=true;else delete DB.user.pwPending;
+  save();REG.pin1=null;setPhase(np?'pw':'pin')}
+async function loginFinish(cloudUp){let acc=accLoad(REG.tgId)||accAdoptByPhone(REG.phone,REG.cc,REG.tgId,REG.chatId,REG.tgUser);
+      if(!acc&&cloudUp){try{const st=await withTO(syFetchAll(String(REG.tgId)),15000);if(st){acc=st;acc.user=Object.assign({},st.user,{telegramUserId:String(REG.tgId),tgChat:REG.chatId,tgUsername:REG.tgUser});REG.fromCloud=true}}catch(e){console.warn('cloud restore failed',e)}}
+      if(!acc){const _d=DB;DB={theme:_d.theme||'system',user:{id:'u_'+uid()+uid(),name:REG.name||REG.tgName||'',phone:REG.phone,cc:REG.cc,telegramUserId:String(REG.tgId),tgChat:REG.chatId,tgUsername:REG.tgUser,telegramVerified:true,phoneVerified:false,language:'ru',currency:'TJS',plan:'free',createdAt:Date.now(),updatedAt:Date.now()}};blankData();acc=DB;DB=_d}
+      const th=DB.theme||'system';DB=acc;DB.theme=th;Object.assign(DB.user,{tgChat:REG.chatId,tgUsername:REG.tgUser});REG.returning=true;
+      tgSend(REG.fromCloud?'🔑 Выполнен вход в ZINDAGI на новом устройстве. Ваши данные загружены из облака.':'🔑 Выполнен вход в ZINDAGI.',REG.chatId);authDone()}
+
+function authPlogin(A){
+  const c0=ccOf(REG.cc);
+  A.innerHTML=`<div class="body"><div style="margin-bottom:14px"><button class="ib" id="p_back" aria-label="Назад">${ic('back')}</button></div>
+    <h1>Вход в аккаунт</h1><p class="lead">Введите номер телефона и пароль, которые вы задали при регистрации.</p>
+    <label class="fld" for="p_phone"><span>Телефон</span><div class="phone"><div class="cc"><span id="p_ccl"></span><span class="cv" aria-hidden="true">▾</span><select id="p_cc" aria-label="Страна">${COUNTRIES.map(c=>`<option value="${c.cc}"${c.cc===c0.cc?' selected':''}>${c.flag} ${c.name} (+${c.cc})</option>`).join('')}</select></div><input class="inp" id="p_phone" inputmode="tel" placeholder="${c0.ph}" autocomplete="tel-national" value="${esc(grpDigits(String(REG.phone||''),c0.grp))}"></div></label>
+    <label class="fld"><span>Пароль</span><input class="inp" id="p_pw" type="password" autocomplete="current-password" placeholder="Пароль"></label>
+    <div class="ferr" role="alert" id="p_err"></div>
+    <button class="btn pri blk" id="p_go">Войти</button>
+    <div class="center" style="margin-top:10px"><button class="link" id="p_forgot">Забыли пароль?</button></div>
+    <div class="center small" style="margin-top:6px">Нет аккаунта? <button class="link" id="p_reg" style="padding:0 4px">Зарегистрироваться</button></div>
+  </div>`;
+  const ph=$('#p_phone',A),pw=$('#p_pw',A),er=$('#p_err',A),cs=$('#p_cc',A),cl=$('#p_ccl',A),btn=$('#p_go',A);
+  const cur=()=>ccOf(cs.value);
+  const paintCc=()=>{const c=cur();cl.textContent=c.flag+' +'+c.cc;ph.placeholder=c.ph};
+  const fmtPh=()=>{const c=cur();ph.value=grpDigits(natDigits(c,ph.value),c.grp)};
+  paintCc();netWatch();
+  cs.addEventListener('change',()=>{REG.cc=cs.value;try{localStorage.setItem(CC_LS,cs.value)}catch(e){}paintCc();fmtPh();er.textContent='';ph.focus()});
+  ph.addEventListener('input',fmtPh);
+  $('#p_back',A).onclick=()=>setPhase('welcome');
+  $('#p_reg',A).onclick=()=>setPhase('welcome');
+  const phoneCheck=()=>{const c=cur(),p=natDigits(c,ph.value);ph.classList.toggle('err',!phoneOk(c,p));if(!phoneOk(c,p)){er.textContent=phoneErr(c,p);ph.focus();return null}return{c,p}};
+  $('#p_forgot',A).onclick=()=>{const r=phoneCheck();if(!r)return;er.textContent='';startLogin(r.p,r.c.cc,true)};
+  const go=async()=>{const r=phoneCheck();if(!r)return;const {c,p}=r,pass=pw.value;
+    if(!pass){er.textContent='Введите пароль';pw.focus();return}
+    er.textContent='';btn.disabled=true;btn.textContent='Проверяем…';
+    try{
+      if(!(await netCheck())){vpnDialog();er.textContent='Нет связи с сервером. Отключите VPN и повторите.';return}
+      const full=fullPhone(c.cc,p),k=await pwKey(pass,full),tok=newStartToken();
+      await rtdb('authreq/'+tok,'PUT',{phone:full,k},8000);
+      const m=await waitSession(tok);
+      if(!m){er.textContent='Сервер не ответил. Повторите через минуту.';return}
+      if(m.status==='bad'){pw.value='';pw.focus();er.textContent='Неверный пароль. Осталось попыток: '+(m.left>0?m.left:0);return}
+      if(m.status==='locked'){er.textContent='Слишком много попыток. Повторите через '+(m.wait||15)+' мин. или нажмите «Забыли пароль?».';return}
+      if(m.status==='nopw'){er.textContent='Для этого аккаунта пароль ещё не задан. Нажмите «Забыли пароль?»: бот проверит ваш Telegram, и вы зададите пароль.';return}
+      if(m.status==='not_found'){er.innerHTML='Аккаунт с этим номером не найден. <button class="link" id="p_reg2" style="min-height:32px;padding:0">Зарегистрироваться</button>';$('#p_reg2',A).onclick=()=>setPhase('welcome');return}
+      if(m.status==='blocked'){er.textContent='Аккаунт заблокирован. Откройте бота @'+BOT_USERNAME+' и нажмите «Связаться со службой поддержки».';return}
+      if(m.status!=='ok'){er.textContent='Не удалось выполнить вход. Повторите позже.';return}
+      Object.assign(REG,{login:true,reset:false,needPw:false,viaBot:true,live:false,phone:p,cc:c.cc,sessionId:tok,token:'',tgId:m.tgId,chatId:m.chatId,tgName:m.tgName||'',tgUser:m.tgUser||'',returning:true,ct:m.ct||null,used:true,name:m.name||''});
+      const cloudUp=await syLogin(k);
+      await loginFinish(cloudUp)
+    }catch(e){
+      if(e&&(e.status===401||e.status===403))er.textContent='Нет доступа к серверу входа. Администратору нужно обновить правила Firebase.';
+      else if(e&&!e.status){NET.ok=false;vpnDialog();er.textContent='Нет связи с сервером. Отключите VPN и повторите.'}
+      else{console.warn(e);er.textContent='Не удалось выполнить вход. Повторите позже.'}
+    }finally{if(btn.isConnected){btn.disabled=false;btn.textContent='Войти'}}};
+  btn.onclick=go;A.onkeydown=e=>{if(e.key==='Enter'&&e.target.tagName==='INPUT')go()}}
+
+function authPw(A){
+  const reset=!!REG.reset;
+  A.innerHTML=`<div class="body"><h1>${reset?'Новый пароль':'Придумайте пароль'}</h1>
+    <p class="lead">${reset?'Введите новый пароль для входа в аккаунт.':'Этим паролем вы будете входить в аккаунт с любого устройства, без Telegram.'}</p>
+    <label class="fld"><span>Пароль</span><input class="inp" id="w1" type="password" autocomplete="new-password" placeholder="Не короче 6 символов"></label>
+    <label class="fld"><span>Повторите пароль</span><input class="inp" id="w2" type="password" autocomplete="new-password" placeholder="Ещё раз"></label>
+    <div class="ferr" role="alert" id="w_err"></div>
+    <button class="btn pri blk" id="w_go">Сохранить</button></div>`;
+  const w1=$('#w1',A),w2=$('#w2',A),er=$('#w_err',A),btn=$('#w_go',A);
+  const go=async()=>{const a=w1.value,b=w2.value;
+    if(a.length<6){er.textContent='Пароль должен быть не короче 6 символов';w1.focus();return}
+    if(a!==b){er.textContent='Пароли не совпадают';w2.focus();return}
+    er.textContent='';btn.disabled=true;btn.textContent='Сохраняем…';
+    try{
+      if(!FB)throw Object.assign(new Error('nofb'),{code:'nofb'});
+      if(!(await netCheck())){vpnDialog();er.textContent='Нет связи с сервером. Отключите VPN и повторите.';return}
+      const user=await withTO(new Promise(r=>{const un=FB.auth.onAuthStateChanged(x=>{un();r(x)})}),8000);
+      const tid=String((DB.user&&DB.user.telegramUserId)||REG.tgId||'');
+      if(!user||user.uid!==tid){er.textContent='Нет связи с облаком. Выйдите и войдите через Telegram заново.';return}
+      const k=await pwKey(a,fullPhone((DB.user&&DB.user.cc)||REG.cc,(DB.user&&DB.user.phone)||REG.phone));
+      await withTO(FB.db.ref('pw/'+tid).set({v:await sha(k),ts:firebase.database.ServerValue.TIMESTAMP}),10000);
+      if(DB.user)delete DB.user.pwPending;REG.needPw=false;REG.reset=false;save();setPhase('pin')
+    }catch(e){console.warn(e);er.textContent=(e&&e.code==='PERMISSION_DENIED')?'Нет доступа: администратору нужно опубликовать правила Firebase (блок pw).':'Не удалось сохранить пароль. Проверьте интернет и повторите.'}
+    finally{if(btn.isConnected){btn.disabled=false;btn.textContent='Сохранить'}}};
+  btn.onclick=go;A.onkeydown=e=>{if(e.key==='Enter'&&e.target.tagName==='INPUT')go()}}
+
 function authWelcome(A){
   A.innerHTML=`<div class="ahero"><div class="abg">${heroSVG('a')}</div><div class="mkt"><img src="${MARK}" alt="ZINDAGI"></div>
     <div class="langsw" role="group" aria-label="Language">${[['ru','RU'],['en','EN'],['tg','TJ']].map(([l,n])=>`<button type="button" data-act="setLang" data-l="${l}" aria-pressed="${I18N.lang===l}">${n}</button>`).join('')}</div></div>
@@ -1582,12 +1691,12 @@ function authWelcome(A){
   const cur=()=>ccOf(cs.value);
   const paintCc=()=>{const c=cur();cl.textContent=c.flag+' +'+c.cc;ph.placeholder=c.ph};
   const fmtPh=()=>{const c=cur();ph.value=grpDigits(natDigits(c,ph.value),c.grp)};
-  paintCc();
+  paintCc();netWatch();
   cs.addEventListener('change',()=>{REG.cc=cs.value;try{localStorage.setItem(CC_LS,cs.value)}catch(e){}paintCc();fmtPh();er.textContent='';ph.classList.remove('err');ph.focus()});
   ph.addEventListener('input',fmtPh);
-  const go=async()=>{const c=cur(),n=nm.value.trim(),p=natDigits(c,ph.value);nm.classList.toggle('err',n.length<2);ph.classList.toggle('err',!phoneOk(c,p));
+  const go=async()=>{if(!netGate())return;const c=cur(),n=nm.value.trim(),p=natDigits(c,ph.value);nm.classList.toggle('err',n.length<2);ph.classList.toggle('err',!phoneOk(c,p));
     if(n.length<2){er.textContent='Введите имя';nm.focus();return}if(!phoneOk(c,p)){er.textContent=phoneErr(c,p);ph.focus();return}
-    Object.assign(REG,{name:n,phone:p,cc:c.cc,sessionId:uid()+uid(),token:'',link:'',live:false,sent:false,code:null,otpHash:null,attempts:0,used:false,pin1:null,returning:false,viaBot:false,startToken:'',chatId:null,tgId:null,tgName:'',tgUser:'',login:false});
+    Object.assign(REG,{name:n,phone:p,cc:c.cc,sessionId:uid()+uid(),token:'',link:'',live:false,sent:false,code:null,otpHash:null,attempts:0,used:false,pin1:null,returning:false,viaBot:false,startToken:'',chatId:null,tgId:null,tgName:'',tgUser:'',login:false,reset:false,needPw:true});
     if(BOT_READY){REG.viaBot=true;REG.startToken=newStartToken();REG.link='https://t.me/'+BOT_USERNAME+'?start=r'+fullPhone(c.cc,p)+REG.startToken;
       openTgLink(REG.link);   /* открываем Telegram сразу по нажатию */
       return setPhase('tg')}
@@ -1595,7 +1704,7 @@ function authWelcome(A){
     const btn=$('#r_go',A);btn.disabled=true;btn.textContent='Подготовка…';
     try{const r=await api('/register/start',{body:{name:n,phone:p}});Object.assign(REG,{live:true,token:r.token,link:r.botLink});setPhase('tg')}
     catch(e){btn.disabled=false;btn.textContent='Продолжить';er.innerHTML='Сервер регистрации недоступен. '+(BOT_READY?'':'Подключите своего бота: впишите токен в TG_TOKEN в файле index.html. ')+'<button class="link" id="r_off" style="min-height:32px;padding:0">Продолжить в демо-режиме</button>';$('#r_off',A).onclick=()=>setPhase('tg')}};
-  $('#r_go',A).onclick=go;A.onkeydown=e=>{if(e.key==='Enter'&&e.target.tagName==='INPUT')go()};$('#r_demo',A).onclick=startDemo;$('#r_login',A).onclick=()=>{const c=cur(),p=natDigits(c,ph.value);ph.classList.toggle('err',!phoneOk(c,p));if(!phoneOk(c,p)){er.textContent='Для входа введите номер, указанный при регистрации. '+phoneErr(c,p);ph.focus();return}er.textContent='';startLogin(p,c.cc)}}
+  $('#r_go',A).onclick=go;A.onkeydown=e=>{if(e.key==='Enter'&&e.target.tagName==='INPUT')go()};$('#r_demo',A).onclick=startDemo;$('#r_login',A).onclick=()=>{const c=cur(),p=natDigits(c,ph.value);Object.assign(REG,{cc:c.cc,phone:p,login:false,reset:false});setPhase('plogin')}}
 
 async function sendOtp(){let r;try{r=crypto.getRandomValues(new Uint32Array(1))[0]}catch(e){r=Math.floor(Math.random()*4e9)}
   const code=String(100000+r%900000);REG.code=code;REG.otpHash=await sha(REG.sessionId+code);REG.expiresAt=Date.now()+5*MIN;REG.resendAt=Date.now()+30000;REG.attempts=0;REG.used=false;REG.sent=true}
@@ -1607,7 +1716,7 @@ function authTg(A){
   const s=REG.sent,live=REG.live;
   A.innerHTML=`<div class="body"><div style="margin-bottom:14px"><button class="ib" id="t_back" aria-label="Назад">${ic('back')}</button></div>
     ${REG.login?'':`<div class="steps" role="img" aria-label="Шаг 2 из 4">${steps(2)}</div>`}
-    <h1>${REG.login?'Вход через Telegram':'Подтвердите Telegram'}</h1>
+    <h1>${REG.reset?'Сброс пароля':REG.login?'Вход через Telegram':'Подтвердите Telegram'}</h1>
     ${s?`<p class="lead">${live||REG.viaBot?`Код отправлен в Telegram-бот @${BOT_USERNAME}. Введите его ниже.`:'Код отправлен в Telegram. Введите его ниже.'}</p>
       ${live||REG.viaBot?'':`<div class="tg"><div class="ta"><img src="${MARK}" alt=""></div><div><b>ZindagiBot</b><p>Ваш код ZINDAGI: ${REG.code}\nКод действует 5 минут.\nНикому его не сообщайте.</p><small>Демо-режим: сервер недоступен, поэтому код показан здесь. В рабочем режиме он приходит только в Telegram.</small></div></div>`}
       <div class="otp" id="otp">${[0,1,2,3,4,5].map(i=>`<input inputmode="numeric" maxlength="1" ${i===0?'autocomplete="one-time-code"':''} aria-label="Цифра ${i+1}">`).join('')}</div>
@@ -1625,10 +1734,10 @@ function authTg(A){
       <div class="card" style="margin:0 0 18px;display:flex;gap:14px;align-items:center"><span class="ico" style="--c:#2F8FE0;width:52px;height:52px;border-radius:16px">${ic('telegram')}</span><div class="small" style="font-size:14px">Бот свяжет ваш Telegram с этой регистрацией по одноразовой ссылке и пришлёт 6-значный код.</div></div>
       <button class="btn pri blk" id="t_open">${ic('telegram')}Открыть Telegram</button>`}
   </div>`;
-  $('#t_back',A).onclick=()=>{REG.pre='';setPhase('welcome')};
+  $('#t_back',A).onclick=()=>{REG.pre='';setPhase(REG.reset?'plogin':'welcome')};
   if(!s){
     if(REG.viaBot){
-      const st=$('#t_st',A),t0=Date.now();let busy=false,dead=false,timer;
+      const st=$('#t_st',A),t0=Date.now();let busy=false,dead=false,timer,nf=0;
       const box0=$('#otp',A),err0=$('#t_err',A),ok0=$('#t_ok',A);
       const otp0=mountOtp(box0,v=>{REG.pre=v;box0.classList.remove('err');err0.textContent='';if(v.length===6)ok0.click()});
       if(REG.pre)$$('input',box0).forEach((i,j)=>i.value=REG.pre[j]||'');
@@ -1641,7 +1750,7 @@ function authTg(A){
         if(!st.isConnected||UI.phase!=='tg'){stop();return}
         if(Date.now()-t0>10*MIN)return fail('Ссылка устарела. Вернитесь назад и начните заново.');
         busy=true;
-        try{const m=await tgSession(REG.startToken);if(dead)return;
+        try{const m=await tgSession(REG.startToken);if(dead)return;nf=0;
           if(m&&m.status){
             if(m.status==='ok'){
               if(!(REG.otpHash&&m.codeHash===REG.otpHash)){   /* новый код (первый или повторный) */
@@ -1655,7 +1764,7 @@ function authTg(A){
               else if(m.status==='not_found'){st.innerHTML='Аккаунт с номером '+esc(maskPhone(REG.phone,REG.cc))+' не найден. <button class="link" id="t_reg" style="min-height:32px;padding:0">Зарегистрироваться</button>';$('#t_reg',A).onclick=()=>setPhase('welcome')}
               else st.textContent='Ссылка недействительна. Вернитесь назад и начните заново.';
               return}}}
-        catch(e){if(e.status===401||e.status===403)return fail('Нет доступа к серверу входа. Администратору нужно обновить правила Firebase.')}
+        catch(e){if(e.status===401||e.status===403)return fail('Нет доступа к серверу входа. Администратору нужно обновить правила Firebase.');if(!e.status&&++nf===3){NET.ok=false;vpnDialog()}}
         busy=false;clearTimeout(timer);timer=setTimeout(tick,2000)};
       const vis=()=>{if(!document.hidden){clearTimeout(timer);tick()}};
       document.addEventListener('visibilitychange',vis);window.addEventListener('focus',vis);window.addEventListener('pageshow',vis);
@@ -1673,7 +1782,7 @@ function authTg(A){
   const err=$('#t_err',A),info=$('#t_info',A),re=$('#t_re',A),box=$('#otp',A),okb=$('#t_ok',A);const pre=REG.pre||'';REG.pre='';
   const otp=mountOtp(box,()=>{box.classList.remove('err');err.textContent=''});setTimeout(()=>$('input',box).focus(),50);
   const bad=m=>{err.textContent=m;err.classList.add('bad');box.classList.add('err');box.classList.remove('shake');void box.offsetWidth;box.classList.add('shake')};
-  const finish=()=>{DB.user.cloud=!!live||!!(FB&&FB.auth.currentUser);DB.salt=uid()+uid();delete DB.pinHash;DB.bio=false;save();REG.pin1=null;setPhase('pin')};
+  const finish=()=>authDone();
   const verifyLocal=async v=>{
     if(REG.used||Date.now()>REG.expiresAt)return bad('Срок действия кода истёк. Запросите новый.');
     if(REG.attempts>=5)return bad('Слишком много попыток. Запросите новый код.');
@@ -1681,11 +1790,7 @@ function authTg(A){
     if(h!==REG.otpHash){const left=5-REG.attempts;otp.clear();return bad(left>0?`Неверный код. Осталось попыток: ${left}`:'Слишком много попыток. Запросите новый код.')}
     REG.used=true;REG.otpHash=null;REG.code=null;REG.fromCloud=false;
     const cloudUp=REG.viaBot?await syLogin(v):false;   /* вход в Firebase: токен расшифровывается этим же кодом */
-    if(REG.login||REG.returning){let acc=accLoad(REG.tgId)||accAdoptByPhone(REG.phone,REG.cc,REG.tgId,REG.chatId,REG.tgUser);
-      if(!acc&&cloudUp){try{const st=await withTO(syFetchAll(String(REG.tgId)),15000);if(st){acc=st;acc.user=Object.assign({},st.user,{telegramUserId:String(REG.tgId),tgChat:REG.chatId,tgUsername:REG.tgUser});REG.fromCloud=true}}catch(e){console.warn('cloud restore failed',e)}}
-      if(!acc){const _d=DB;DB={theme:_d.theme||'system',user:{id:'u_'+uid()+uid(),name:REG.name||REG.tgName||'',phone:REG.phone,cc:REG.cc,telegramUserId:String(REG.tgId),tgChat:REG.chatId,tgUsername:REG.tgUser,telegramVerified:true,phoneVerified:false,language:'ru',currency:'TJS',plan:'free',createdAt:Date.now(),updatedAt:Date.now()}};blankData();acc=DB;DB=_d}
-      const th=DB.theme||'system';DB=acc;DB.theme=th;Object.assign(DB.user,{tgChat:REG.chatId,tgUsername:REG.tgUser});REG.returning=true;
-      tgSend(REG.fromCloud?'🔑 Выполнен вход в ZINDAGI на новом устройстве. Ваши данные загружены из облака.':'🔑 Выполнен вход в ZINDAGI.',REG.chatId);finish();return}
+    if(REG.login||REG.returning){await loginFinish(cloudUp);return}
     DB={theme:DB.theme||'system'};DB.user={id:'u_'+uid()+uid(),name:REG.name,phone:REG.phone,cc:REG.cc,telegramUserId:'tg_'+(100000000+Math.floor(Math.random()*899999999)),telegramVerified:true,phoneVerified:true,language:'ru',currency:'TJS',plan:'free',createdAt:Date.now(),updatedAt:Date.now()};
     if(REG.viaBot){Object.assign(DB.user,{telegramUserId:String(REG.tgId),tgChat:REG.chatId,tgUsername:REG.tgUser,phoneVerified:false});blankData();
       tgSend('✅ Аккаунт ZINDAGI привязан к этому чату. Сюда будут приходить уведомления о расходах, задачах и целях.',REG.chatId);
@@ -2529,7 +2634,7 @@ if('serviceWorker' in navigator&&/^https?:$/.test(location.protocol))window.addE
 function setLanguage(l){DB.lang=l;save();I18N.set(l);if(UI.phase==='app'){render();renderTabs()}}
 function boot(){
   applyTheme();accSave();I18N.setCur(DB.currency||'TJS',{silent:true});I18N.set(DB.lang||I18N.detect());
-  if(hasUser()){UI.phase=DB.pinHash?'lock':'app'}else UI.phase='welcome';
+  if(hasUser()){UI.phase=(DB.user&&DB.user.pwPending&&!DB.user.demo)?'pw':(DB.pinHash?'lock':'app')}else UI.phase='welcome';
   if(UI.phase==='app'){render();cloudSync();premRefresh()}renderAuth();
   setTimeout(()=>{const sp=$('#splash');if(!sp)return;sp.classList.add('out');setTimeout(()=>sp.remove(),520)},1500)}
 boot();
