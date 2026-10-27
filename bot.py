@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import html
 import json
 import logging
@@ -884,7 +885,7 @@ class PremiumBot:
 
 # ───────────────────────────── бот входа ─────────────────────────────
 # r|l + телефон (9 цифр у старой версии приложения, 11–12 с кодом страны у новой) + токен сессии
-PAYLOAD_RE = re.compile(r"([rl])(\d{9,15})([0-9a-f]{32})")
+PAYLOAD_RE = re.compile(r"([rlp])(\d{9,15})([0-9a-f]{32})")   # r — регистрация, l — вход, p — сброс пароля
 
 # Причины отказа: (кнопка для админа, текст для пользователя)
 REJECT_REASONS: list[tuple[str, str]] = [
@@ -977,7 +978,7 @@ class LoginBot:
             return "phone_taken", mask_phone(my_phone), False
         if my_phone and my_phone != phone:
             return "tg_has_other", mask_phone(my_phone), False
-        if mode == "l":
+        if mode in ("l", "p"):
             return "not_found", "", False
         if not self.fb.claim(f"phones/{phone}", uid):  # кто-то успел раньше
             return "phone_taken", "", False
@@ -1089,8 +1090,9 @@ class LoginBot:
         except Exception:
             log.exception("custom token не создан — синхронизация данных с облаком недоступна")
         name = frm.get("first_name") or ""
+        title = "Код для сброса пароля ZINDAGI" if mode == "p" else "Ваш код для входа в ZINDAGI"
         sent = self.send(chat, f"👋 {name + ', здравствуйте!' if name else 'Здравствуйте!'}\n"
-                               f"🔐 Ваш код для входа в ZINDAGI: {code}\n\nДействует 5 минут. Никому не сообщайте.")
+                               f"🔐 {title}: {code}\n\nДействует 5 минут. Никому не сообщайте.")
         if sent:
             self.fb.set(key, base)
 
@@ -1791,6 +1793,62 @@ class LoginBot:
                     p["reply_markup"] = kb([[(label, "url:" + app)]])
             self.tg.call("sendMessage", **p)
 
+    # --- вход по паролю: приложение кладёт authreq/<токен> = {phone, k}; ответ бот пишет в sessions/<токен> ---
+    # k — ключ, который приложение выводит из пароля (PBKDF2). Сам пароль на сервер не попадает.
+    # В pw/<tg-id> хранится только SHA-256(k). Если ключ верный, бот шифрует им Firebase-токен (как кодом из Telegram).
+    PW_MAX_FAILS = 5
+    PW_LOCK_MS = 15 * 60_000
+
+    def drain_authreq(self) -> None:
+        for tok in self.fb.keys("authreq"):
+            req = self.fb.get(f"authreq/{tok}")
+            self.fb.delete(f"authreq/{tok}")
+            if not isinstance(req, dict) or not re.fullmatch(r"[0-9a-f]{32}", tok):
+                continue
+            try:
+                self.handle_authreq(tok, req)
+            except Exception:
+                log.exception("authreq")
+                self.fb.set(f"sessions/{tok}", {"status": "error", "ts": int(time.time() * 1000)})
+
+    def handle_authreq(self, tok: str, req: dict) -> None:
+        now = int(time.time() * 1000)
+
+        def out(d: dict) -> None:
+            self.fb.set(f"sessions/{tok}", {**d, "ts": now})
+
+        phone = canon_phone(str(req.get("phone") or ""))
+        k = str(req.get("k") or "")
+        if not phone or not re.fullmatch(r"[0-9a-f]{64}", k):
+            return out({"status": "bad_request"})
+        if self.fb.get(f"blocked/phone/{phone}") is not None:
+            return out({"status": "blocked"})
+        owner, _ = self.owner_of(phone)
+        if owner is None:
+            return out({"status": "not_found"})
+        if self.fb.get(f"blocked/uid/{owner}") is not None:
+            return out({"status": "blocked"})
+        fail = self.fb.get(f"authfail/{owner}") or {}
+        until = int(fail.get("until") or 0)
+        if until > now:
+            return out({"status": "locked", "wait": (until - now) // 60_000 + 1})
+        pw = self.fb.get(f"pw/{owner}")
+        if not isinstance(pw, dict) or not pw.get("v"):
+            return out({"status": "nopw"})
+        if not hmac.compare_digest(hashlib.sha256(k.encode()).hexdigest(), str(pw["v"])):
+            n = int(fail.get("n") or 0) + 1
+            if n >= self.PW_MAX_FAILS:
+                self.fb.set(f"authfail/{owner}", {"n": 0, "until": now + self.PW_LOCK_MS})
+                return out({"status": "locked", "wait": self.PW_LOCK_MS // 60_000})
+            self.fb.set(f"authfail/{owner}", {"n": n, "until": 0})
+            return out({"status": "bad", "left": self.PW_MAX_FAILS - n})
+        self.fb.delete(f"authfail/{owner}")
+        u = self.fb.get(f"tgusers/{owner}") or {}
+        out({"status": "ok", "tgId": owner, "chatId": int(u.get("chat") or owner),
+             "tgName": (u.get("name") or "").split(" ")[0], "tgUser": u.get("username") or "",
+             "name": u.get("name") or "", "returning": True,
+             "ct": wrap_token(tok, k, self.fb.custom_token(owner))})
+
     def cleanup(self) -> None:
         sess = self.fb.get("sessions")
         if isinstance(sess, dict):
@@ -1804,6 +1862,7 @@ class LoginBot:
         while True:
             try:
                 self.drain_outbox()
+                self.drain_authreq()
                 if time.time() - last_clean > 600:
                     last_clean = time.time()
                     self.cleanup()
