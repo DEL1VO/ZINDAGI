@@ -44,6 +44,11 @@ log = logging.getLogger("zindagi-pay")
 TZ = timezone(timedelta(hours=5))  # Таджикистан, UTC+5
 DAY_MS = 86_400_000
 
+# ZINDAGI BUSINESS: код тарифа из start-параметра → (месяцев, цена за месяц, дней доступа)
+BIZ_PLANS = {"1": (1, 299, 30), "6": (6, 249, 183), "Y": (12, 199, 365)}
+BIZ_CODE = {1: "1", 6: "6", 12: "Y"}
+BIZ_LABEL = {1: "1 месяц", 6: "6 месяцев", 12: "1 год"}
+
 
 # ───────────────────────────── настройки ─────────────────────────────
 def load_env(path: str = ".env") -> None:
@@ -283,6 +288,10 @@ class Firebase:
     def clear_premium(self, uid: int) -> None:
         self._db.reference(f"premium/{uid}").delete()
 
+    def set_business(self, uid: int, until_ms: int, plan: str = "biz") -> None:
+        self._db.reference(f"business/{uid}").set(
+            {"until": int(until_ms), "plan": plan, "updatedAt": int(time.time() * 1000)})
+
 
 # ───────────────────────────── хранилище ─────────────────────────────
 class Store:
@@ -305,7 +314,13 @@ class Store:
         CREATE TABLE IF NOT EXISTS premium(
             user_id INTEGER PRIMARY KEY, until INTEGER NOT NULL,      -- миллисекунды
             warned INTEGER DEFAULT 0, ended INTEGER DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS biz(user_id INTEGER PRIMARY KEY, until INTEGER NOT NULL);
         """)
+        for col in ("kind TEXT DEFAULT 'prem'", "months INTEGER DEFAULT 1", "amount INTEGER"):
+            try:
+                self.c.execute(f"ALTER TABLE payments ADD COLUMN {col}")
+            except sqlite3.OperationalError:
+                pass  # колонка уже есть
         self.c.commit()
 
     # users
@@ -337,12 +352,26 @@ class Store:
     def all_review(self) -> list[sqlite3.Row]:
         return self.c.execute("SELECT * FROM payments WHERE status='review' ORDER BY id").fetchall()
 
-    def create_request(self, uid: int, chat_id: int, now: float, wait_s: float) -> int:
+    def create_request(self, uid: int, chat_id: int, now: float, wait_s: float,
+                       kind: str = "prem", months: int = 1, amount: Optional[int] = None) -> int:
         cur = self.c.execute(
-            "INSERT INTO payments(user_id,chat_id,status,created,expires) VALUES(?,?,?,?,?)",
-            (uid, chat_id, "awaiting", now, now + wait_s))
+            "INSERT INTO payments(user_id,chat_id,status,created,expires,kind,months,amount) VALUES(?,?,?,?,?,?,?,?)",
+            (uid, chat_id, "awaiting", now, now + wait_s, kind, months, amount))
         self.c.commit()
         return int(cur.lastrowid)
+
+    def retarget(self, pid: int, kind: str, months: int, amount: Optional[int]) -> None:
+        self.c.execute("UPDATE payments SET kind=?, months=?, amount=? WHERE id=?", (kind, months, amount, pid))
+        self.c.commit()
+
+    def biz_until(self, uid: int) -> int:
+        r = self.c.execute("SELECT until FROM biz WHERE user_id=?", (uid,)).fetchone()
+        return int(r["until"]) if r else 0
+
+    def set_biz(self, uid: int, until_ms: int) -> None:
+        self.c.execute("INSERT INTO biz(user_id,until) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET until=?",
+                       (uid, until_ms, until_ms))
+        self.c.commit()
 
     def set_prompt(self, pid: int, msg_id: int) -> None:
         self.c.execute("UPDATE payments SET prompt_msg=? WHERE id=?", (msg_id, pid))
@@ -577,18 +606,33 @@ class PremiumBot:
         self.tg.call("answerCallbackQuery", callback_query_id=cq_id, text=text, show_alert=alert)
 
     # --- тексты ---
+    def plan_of(self, pay) -> tuple[str, str, int, int]:
+        """(тип, название тарифа, сумма, месяцев) для заявки."""
+        biz = pay["kind"] == "biz"
+        months = int(pay["months"] or 1)
+        amount = int(pay["amount"] or (0 if biz else self.cfg.price))
+        label = f"ZINDAGI BUSINESS — {BIZ_LABEL.get(months, str(months) + ' мес.')}" if biz else "Премиум на 1 месяц"
+        return pay["kind"] or "prem", label, amount or self.cfg.price, months
+
     def requisites_text(self, pay, premium_until_ms: Optional[int]) -> str:
         c = self.cfg
+        kind, label, amount, months = self.plan_of(pay)
         left = max(1, math.ceil((pay["expires"] - self.now()) / 60))
         extra = ""
-        if premium_until_ms and premium_until_ms > self.now() * 1000:
+        if kind == "biz":
+            until = self.store.biz_until(pay["user_id"])
+            if until > self.now() * 1000:
+                extra = (f"У вас уже есть ZINDAGI BUSINESS до <b>{fmt_d(until)}</b>. "
+                         f"Оплата продлит подписку.\n\n")
+        elif premium_until_ms and premium_until_ms > self.now() * 1000:
             extra = (f"У вас уже есть Премиум до <b>{fmt_d(premium_until_ms)}</b>. "
                      f"Оплата продлит подписку ещё на 1 месяц.\n\n")
+        icon = "💼" if kind == "biz" else "💎"
         return (
-            f"💎 <b>Премиум на 1 месяц — {c.price} сомони</b>\n\n{extra}"
+            f"{icon} <b>{label} — {amount} сомони</b>\n\n{extra}"
             f"Оплатите на карту:\n<code>{html.escape(c.card)}</code>\n"
             f"Получатель: <b>{html.escape(c.holder)}</b>\n"
-            f"Сумма: <b>{c.price} сомони</b>\n"
+            f"Сумма: <b>{amount} сомони</b>\n"
             f"Комментарий к переводу: <code>{html.escape(c.note)}</code>\n\n"
             f"После оплаты отправьте сюда чек — фото или скриншот.\n"
             f"⏳ Время ожидания — <b>{left} мин.</b>")
@@ -597,16 +641,19 @@ class PremiumBot:
         u = self.store.user(pay["user_id"])
         name = html.escape((u["name"] if u and u["name"] else "") or (u["tg_name"] if u else "") or "—")
         uname = f"@{html.escape(u['username'])}" if u and u["username"] else "без username"
+        kind, label, amount, months = self.plan_of(pay)
         return (
-            f"🧾 <b>Чек на подписку Премиум</b> · заявка #{pay['id']}\n"
+            f"🧾 <b>Чек: {label}</b> · заявка #{pay['id']}\n"
             f"👤 Имя: <b>{name}</b>\n"
             f"📞 Номер: <b>{fmt_phone(u['phone'] if u else '')}</b>\n"
             f"✈️ Telegram: {uname} · ID <code>{pay['user_id']}</code> · "
             f"<a href=\"tg://user?id={pay['user_id']}\">открыть чат</a>\n"
-            f"💰 {self.cfg.price} сомони · 1 месяц\n"
+            f"💰 {amount} сомони · {BIZ_LABEL.get(months, str(months) + ' мес.') if kind == 'biz' else '1 месяц'}\n"
             f"🕒 {fmt_dt(pay['created'])}{suffix}")
 
-    def retry_kb(self) -> dict:
+    def retry_kb(self, pay=None) -> dict:
+        if pay is not None and pay["kind"] == "biz":
+            return kb([[("🔄 Повторить", "retryb:" + BIZ_CODE.get(int(pay["months"] or 1), "1"))]])
         return kb([[("🔄 Повторить", "retry")]])
 
     # --- входящие ---
@@ -650,11 +697,19 @@ class PremiumBot:
         self.store.upsert_user(frm["id"], name, phone, frm.get("username") or "", full)
 
     def cmd_start(self, m: dict, payload: str) -> None:
+        code = ""
+        if len(payload) > 2 and payload[0] == "b" and payload[1] in BIZ_PLANS:  # b<код тарифа><тот же payload, что и 'p…'>
+            code, payload = payload[1], "p" + payload[2:]
         phone, name = parse_payload(payload)
         self.remember_user(m["from"], phone, name)
+        if code:
+            return self.offer(m["from"]["id"], m["chat"]["id"], "biz", code)
         self.offer(m["from"]["id"], m["chat"]["id"])
 
     def cmd_status(self, uid: int, chat_id: int) -> None:
+        bu = self.store.biz_until(uid)
+        if bu > self.now() * 1000:
+            self.send(chat_id, f"💼 ZINDAGI BUSINESS активен до <b>{fmt_d(bu)}</b>.")
         p = self.store.premium(uid)
         if p and p["until"] > self.now() * 1000:
             self.send(chat_id, f"✅ Премиум активен до <b>{fmt_d(p['until'])}</b>.",
@@ -662,15 +717,23 @@ class PremiumBot:
         else:
             self.send(chat_id, "Премиум не активен.", kb([[("💎 Оформить подписку", "retry")]]))
 
-    def offer(self, uid: int, chat_id: int) -> None:
+    def offer(self, uid: int, chat_id: int, kind: str = "prem", code: str = "1") -> None:
         """Показать реквизиты (создать заявку на оплату, если активной ещё нет)."""
         if self.store.review_request(uid):
             return self._processing(chat_id)
         now = self.now()
+        if kind == "biz":
+            months, per, _days = BIZ_PLANS[code]
+            months_, amount = months, per * months
+        else:
+            months_, amount = 1, self.cfg.price
         pay = self.store.active_request(uid, now)
         if not pay:
-            pid = self.store.create_request(uid, chat_id, now, self.cfg.wait_min * 60)
+            pid = self.store.create_request(uid, chat_id, now, self.cfg.wait_min * 60, kind, months_, amount)
             pay = self.store.payment(pid)
+        elif (pay["kind"] or "prem") != kind or int(pay["months"] or 1) != months_:
+            self.store.retarget(pay["id"], kind, months_, amount)  # пользователь выбрал другой тариф
+            pay = self.store.payment(pay["id"])
         prem = self.store.premium(uid)
         sent = self.send(chat_id, self.requisites_text(pay, prem["until"] if prem else None))
         if sent:
@@ -734,6 +797,10 @@ class PremiumBot:
             self.answer(cq["id"])
             self.remember_user(frm)
             return self.offer(frm["id"], chat_id)
+        if data.startswith("retryb:") and data[7:] in BIZ_PLANS:
+            self.answer(cq["id"])
+            self.remember_user(frm)
+            return self.offer(frm["id"], chat_id, "biz", data[7:])
         m = re.fullmatch(r"(ok|no):(\d+)", data)
         if not m:
             return self.answer(cq["id"])
@@ -750,7 +817,24 @@ class PremiumBot:
             return self.answer(cq_id, f"Заявка #{pid}: {labels.get(pay['status'], pay['status'])}", True)
         uid, now = pay["user_id"], self.now()
         who = html.escape(admin.get("first_name") or admin.get("username") or str(admin["id"]))
-        if approve:
+        if approve and pay["kind"] == "biz":
+            months = int(pay["months"] or 1)
+            days = next((d for m_, _p, d in BIZ_PLANS.values() if m_ == months), 30 * months)
+            until = max(int(now * 1000), self.store.biz_until(uid)) + days * DAY_MS
+            try:
+                self.fb.set_business(uid, until, BIZ_CODE.get(months, "biz"))
+            except Exception:
+                log.exception("Firebase: не удалось записать подписку BUSINESS %s", uid)
+                return self.answer(cq_id, "❌ Не удалось записать подписку в Firebase. Проверьте настройки и нажмите ещё раз.", True)
+            self.store.set_biz(uid, until)
+            self.store.set_status(pid, "approved", admin["id"], now)
+            self.answer(cq_id, "Подтверждено")
+            markup = kb([[("📱 Открыть приложение", "url:" + self.cfg.app_url)]]) if self.cfg.app_url.startswith("http") else None
+            self.send(pay["chat_id"],
+                      f"🎉 <b>Подписка ZINDAGI BUSINESS оформлена!</b>\nДействует до <b>{fmt_d(until)}</b>.\n"
+                      f"Откройте ZINDAGI и перейдите в режим «Бизнес».", markup)
+            self._mark_admin_cards(pid, f"\n\n✅ <b>Подтверждено</b> · {who} · {fmt_dt(now)}")
+        elif approve:
             cur = self.store.premium(uid)
             base = max(int(now * 1000), cur["until"] if cur else 0)
             until = base + self.cfg.days * DAY_MS
@@ -772,7 +856,7 @@ class PremiumBot:
             self.answer(cq_id, "Отклонено")
             self.send(pay["chat_id"],
                       "❌ <b>Платёж не подтверждён.</b>\nПроверьте сумму и карту, затем нажмите «Повторить» и отправьте чек ещё раз.",
-                      self.retry_kb())
+                      self.retry_kb(pay))
             self._mark_admin_cards(pid, f"\n\n❌ <b>Отказано</b> · {who} · {fmt_dt(now)}")
 
     def _mark_admin_cards(self, pid: int, suffix: str) -> None:
