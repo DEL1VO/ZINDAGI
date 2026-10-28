@@ -290,8 +290,11 @@ class Firebase:
         self._db.reference(f"premium/{uid}").delete()
 
     def set_business(self, uid: int, until_ms: int, plan: str = "biz") -> None:
-        self._db.reference(f"business/{uid}").set(
-            {"until": int(until_ms), "plan": plan, "updatedAt": int(time.time() * 1000)})
+        val = {"until": int(until_ms), "plan": plan, "updatedAt": int(time.time() * 1000)}
+        self._db.reference(f"business/{uid}").set(val)
+        # Копия в узле premium/b<id>: его приложение читает по уже опубликованному правилу premium/$uid,
+        # поэтому подписка Business открывается, даже если в Rules нет блока business.
+        self._db.reference(f"premium/b{uid}").set(val)
 
 
 # ───────────────────────────── хранилище ─────────────────────────────
@@ -364,6 +367,9 @@ class Store:
     def retarget(self, pid: int, kind: str, months: int, amount: Optional[int]) -> None:
         self.c.execute("UPDATE payments SET kind=?, months=?, amount=? WHERE id=?", (kind, months, amount, pid))
         self.c.commit()
+
+    def all_biz(self) -> list:
+        return self.c.execute("SELECT user_id, until FROM biz").fetchall()
 
     def biz_until(self, uid: int) -> int:
         r = self.c.execute("SELECT until FROM biz WHERE user_id=?", (uid,)).fetchone()
@@ -2353,6 +2359,14 @@ def main() -> None:
     fb = Firebase(cfg.db_url, cfg.cred_path, cfg.cred_json)
     store = Store(cfg.sqlite)
     bot = PremiumBot(cfg, Telegram(cfg.token), store, fb)
+    # уже оплаченные подписки Business → копия в premium/b<id> (однократно при каждом запуске, безвредно)
+    try:
+        now_ms = int(time.time() * 1000)
+        for r in store.all_biz():
+            if int(r["until"]) > now_ms:
+                fb.set_business(int(r["user_id"]), int(r["until"]))
+    except Exception:
+        log.exception("Не удалось синхронизировать подписки Business в Firebase")
     if cfg.login_token:
         if cfg.login_token == cfg.token:
             raise SystemExit("LOGIN_BOT_TOKEN должен отличаться от BOT_TOKEN: это два разных бота.")
