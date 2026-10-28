@@ -76,6 +76,7 @@ class Cfg:
         self.card = env.get("CARD_NUMBER", "4444 8888 1227 1025").strip()
         self.holder = env.get("CARD_HOLDER", "EHSON IDIEV").strip()
         self.note = env.get("PAY_NOTE", "Подписка премиума на 1 месяц").strip()
+        self.wallet = env.get("PAY_WALLET", "+992 978117811 DCnext / Alif mobi").strip()
         self.wait_min = float(env.get("WAIT_MINUTES", "10"))
         self.days = int(env.get("PREMIUM_DAYS", "30"))
         self.app_url = env.get("APP_URL", "").strip()
@@ -628,12 +629,15 @@ class PremiumBot:
             extra = (f"У вас уже есть Премиум до <b>{fmt_d(premium_until_ms)}</b>. "
                      f"Оплата продлит подписку ещё на 1 месяц.\n\n")
         icon = "💼" if kind == "biz" else "💎"
+        # комментарий к переводу зависит от выбранного тарифа (1 месяц / 6 месяцев / 1 год)
+        note = f"Подписка ZINDAGI BUSINESS на {BIZ_LABEL.get(months, str(months) + ' мес.')}" if kind == "biz" else c.note
         return (
             f"{icon} <b>{label} — {amount} сомони</b>\n\n{extra}"
             f"Оплатите на карту:\n<code>{html.escape(c.card)}</code>\n"
+            f"Оплата на электронный кошелёк\n<code>{html.escape(c.wallet)}</code>\n"
             f"Получатель: <b>{html.escape(c.holder)}</b>\n"
             f"Сумма: <b>{amount} сомони</b>\n"
-            f"Комментарий к переводу: <code>{html.escape(c.note)}</code>\n\n"
+            f"Комментарий к переводу: <code>{html.escape(note)}</code>\n\n"
             f"После оплаты отправьте сюда чек — фото или скриншот.\n"
             f"⏳ Время ожидания — <b>{left} мин.</b>")
 
@@ -831,7 +835,7 @@ class PremiumBot:
             self.answer(cq_id, "Подтверждено")
             markup = kb([[("📱 Открыть приложение", "url:" + self.cfg.app_url)]]) if self.cfg.app_url.startswith("http") else None
             self.send(pay["chat_id"],
-                      f"🎉 <b>Подписка ZINDAGI BUSINESS оформлена!</b>\nДействует до <b>{fmt_d(until)}</b>.\n"
+                      f"🎉 <b>Подписка ZINDAGI BUSINESS оформлена!</b>\n💼 Тариф: {BIZ_LABEL.get(months, str(months) + ' мес.')}\nДействует до <b>{fmt_d(until)}</b>.\n"
                       f"Откройте ZINDAGI и перейдите в режим «Бизнес».", markup)
             self._mark_admin_cards(pid, f"\n\n✅ <b>Подтверждено</b> · {who} · {fmt_dt(now)}")
         elif approve:
